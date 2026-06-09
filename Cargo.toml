@@ -1,0 +1,12 @@
+[package]
+name = "pixview"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+image = "0.25"
+crossterm = "0.28"
+anyhow = "1"
+libc = "0.2"
+color_quant = "1.1"
