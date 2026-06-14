@@ -188,7 +188,13 @@ fn display_sixel<W: Write>(
     buf.extend_from_slice(b"\x1b[H\x1b[2J");
 
     if let Some(text) = status {
-        let _ = write!(&mut buf, "\x1b[{};1H\x1b[2K{}", rows, text);
+        let _ = write!(
+            &mut buf,
+            "\x1b[{};1H\x1b[7m{:<width$}\x1b[0m\x1b[K",
+            rows,
+            text,
+            width = cols as usize
+        );
     }
 
     let (col, row) = center_offset(img_pw, img_ph, cols, rows);
@@ -200,6 +206,9 @@ fn display_sixel<W: Write>(
     if !sixel.is_empty() {
         stdout.write_all(sixel)?;
     }
+    
+    // Move cursor away from the image to the bottom right corner
+    let _ = write!(stdout, "\x1b[{};{}H", rows, cols);
     stdout.flush()?;
     Ok(())
 }
@@ -372,7 +381,7 @@ fn show_image<W: Write>(
     let (cols, rows) = terminal::size()?;
     let (sixel, pw, ph) = encode_for_display(&img, mode, cols, rows, max_colors);
     let status = format!(
-        "{}x{} [{}] │ f toggle │ \u{2191}\u{2193} File │ Esc Back",
+        " {}x{} [{}] │ f toggle │ \u{2191}\u{2193} File │ Esc Back ",
         img.width(),
         img.height(),
         mode.label()
@@ -393,7 +402,7 @@ fn show_image<W: Write>(
                         let (sixel, pw, ph) =
                             encode_for_display(&img, mode, cols, rows, max_colors);
                         let status = format!(
-                            "{}x{} [{}] │ f toggle │ \u{2191}\u{2193} File │ Esc Back",
+                            " {}x{} [{}] │ f toggle │ \u{2191}\u{2193} File │ Esc Back ",
                             img.width(),
                             img.height(),
                             mode.label()
@@ -412,7 +421,7 @@ fn show_image<W: Write>(
                     let (cols, rows) = terminal::size()?;
                     let (sixel, pw, ph) = encode_for_display(&img, mode, cols, rows, max_colors);
                     let status = format!(
-                        "{}x{} [{}] │ f toggle │ \u{2191}\u{2193} File │ Esc Back",
+                        " {}x{} [{}] │ f toggle │ \u{2191}\u{2193} File │ Esc Back ",
                         img.width(),
                         img.height(),
                         mode.label()
@@ -494,79 +503,93 @@ fn show_video<W: Write>(
 
     let action = loop {
         if event::poll(Duration::from_millis(100))? {
-            match event::read()? {
-                Event::Key(key) => {
-                    let prev = current;
-                    let prev_mode = mode;
-                    match key.code {
-                        KeyCode::Right | KeyCode::Char('l') => {
-                            current = (current + 1).min(n_frames - 1);
+            let mut state_changed = false;
+            let mut exit_action = None;
+            let prev_current = current;
+            let prev_mode = mode;
+
+            // Drain the entire event queue to merge sequential input events
+            loop {
+                match event::read()? {
+                    Event::Key(key) => {
+                        match key.code {
+                            KeyCode::Right | KeyCode::Char('l') => {
+                                current = (current + 1).min(n_frames - 1);
+                            }
+                            KeyCode::Left | KeyCode::Char('h') => {
+                                current = current.saturating_sub(1);
+                            }
+                            KeyCode::Tab => {
+                                current = (current + 10).min(n_frames - 1);
+                            }
+                            KeyCode::Char(' ') => {
+                                current = n_frames - 1;
+                            }
+                            KeyCode::BackTab | KeyCode::Backspace => {
+                                current = current.saturating_sub(10);
+                            }
+                            KeyCode::Home => {
+                                current = 0;
+                            }
+                            KeyCode::End => {
+                                current = n_frames - 1;
+                            }
+                            KeyCode::Char('f') => {
+                                mode = if mode == DisplayMode::Fit {
+                                    DisplayMode::Fullscreen
+                                } else {
+                                    DisplayMode::Fit
+                                };
+                            }
+                            KeyCode::Up | KeyCode::Char('k') => {
+                                exit_action = Some(ViewerAction::PreviousFile);
+                            }
+                            KeyCode::Down | KeyCode::Char('j') => {
+                                exit_action = Some(ViewerAction::NextFile);
+                            }
+                            KeyCode::Char('q') | KeyCode::Esc => {
+                                exit_action = Some(ViewerAction::ReturnToBrowser);
+                            }
+                            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                                exit_action = Some(ViewerAction::QuitProgram);
+                            }
+                            _ => {}
                         }
-                        KeyCode::Left | KeyCode::Char('h') => {
-                            current = current.saturating_sub(1);
-                        }
-                        KeyCode::Tab => {
-                            current = (current + 10).min(n_frames - 1);
-                        }
-                        KeyCode::Char(' ') => {
-                            current = n_frames - 1;
-                        }
-                        KeyCode::BackTab | KeyCode::Backspace => {
-                            current = current.saturating_sub(10);
-                        }
-                        KeyCode::Home => {
-                            current = 0;
-                        }
-                        KeyCode::End => {
-                            current = n_frames - 1;
-                        }
-                        KeyCode::Char('f') => {
-                            mode = if mode == DisplayMode::Fit {
-                                DisplayMode::Fullscreen
-                            } else {
-                                DisplayMode::Fit
-                            };
-                        }
-                        KeyCode::Up | KeyCode::Char('k') => break ViewerAction::PreviousFile,
-                        KeyCode::Down | KeyCode::Char('j') => break ViewerAction::NextFile,
-                        KeyCode::Char('q') | KeyCode::Esc => break ViewerAction::ReturnToBrowser,
-                        KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                            break ViewerAction::QuitProgram;
-                        }
-                        _ => continue,
                     }
-                    if current != prev || mode != prev_mode {
-                        render_video_frame(
-                            stdout,
-                            &frames,
-                            current,
-                            mode,
-                            max_colors,
-                            n_frames,
-                            &timestamps,
-                            duration,
-                            &ready,
-                            &done,
-                        )?;
-                        rendered_frame = true;
+                    Event::Resize(_, _) => {
+                        state_changed = true;
                     }
+                    _ => {}
                 }
-                Event::Resize(_, _) => {
-                    render_video_frame(
-                        stdout,
-                        &frames,
-                        current,
-                        mode,
-                        max_colors,
-                        n_frames,
-                        &timestamps,
-                        duration,
-                        &ready,
-                        &done,
-                    )?;
-                    rendered_frame = true;
+
+                if exit_action.is_some() {
+                    break;
                 }
-                _ => {}
+
+                // If no more events are immediately queued, exit the inner processing loop
+                if !event::poll(Duration::ZERO)? {
+                    break;
+                }
+            }
+
+            if let Some(action) = exit_action {
+                break action;
+            }
+
+            if current != prev_current || mode != prev_mode || state_changed {
+                render_video_frame(
+                    stdout,
+                    &frames,
+                    current,
+                    mode,
+                    max_colors,
+                    n_frames,
+                    &timestamps,
+                    duration,
+                    &ready,
+                    &done,
+                )?;
+                rendered_frame = true;
             }
         } else {
             let r = ready.load(Ordering::Relaxed);
@@ -600,9 +623,9 @@ fn show_video<W: Write>(
             } else {
                 let load_pct = r * 100 / n_frames;
                 let status = if done.load(Ordering::Relaxed) {
-                    format!("  (frame {} unavailable)", current)
+                    format!("  (frame {} unavailable) ", current)
                 } else {
-                    format!("  loading frame {}... {}%", current, load_pct)
+                    format!("  loading frame {}... {:>3}% ", current, load_pct)
                 };
                 drop(guard);
                 update_status_line(stdout, &status)?;
@@ -619,9 +642,17 @@ fn show_video<W: Write>(
 }
 
 fn update_status_line<W: Write>(stdout: &mut W, text: &str) -> Result<()> {
-    let (_, rows) = terminal::size()?;
-    let mut buf = Vec::with_capacity(text.len() + 16);
-    let _ = write!(&mut buf, "\x1b[{};1H\x1b[2K{}", rows, text);
+    let (cols, rows) = terminal::size()?;
+    let mut buf = Vec::with_capacity(text.len() + 32);
+    let _ = write!(
+        &mut buf,
+        "\x1b[{};1H\x1b[7m{:<width$}\x1b[0m\x1b[K\x1b[{};{}H",
+        rows,
+        text,
+        rows,
+        cols,
+        width = cols as usize
+    );
     stdout.write_all(&buf)?;
     stdout.flush()?;
     Ok(())
@@ -649,10 +680,14 @@ fn video_status(
     let load_tag = if done.load(Ordering::Relaxed) {
         String::new()
     } else {
-        format!(" \u{2502} loading {}%", load_pct)
+        format!(" \u{2502} loading {:>3}%", load_pct)
     };
+    
+    // Calculates the required padding for frame text (e.g. 100 -> 3 chars)
+    let digits = (n.saturating_sub(1)).to_string().len().max(1);
+
     format!(
-        "[{}/{}] {:.0}% {} {} / {} [{}]{} │ \u{2190}\u{2192} \u{00b1}1 │ Tab +10 │ \u{232b} -10 │ Space End │ \u{2191}\u{2193} File │ Esc Back",
+        " [{:>w$}/{}] {:>3.0}% {} {} / {} [{}]{} │ \u{2190}\u{2192} \u{00b1}1 │ Tab +10 │ \u{232b} -10 │ Space End │ \u{2191}\u{2193} File │ Esc Back ",
         current,
         n - 1,
         progress,
@@ -661,6 +696,7 @@ fn video_status(
         format_time(duration),
         mode.label(),
         load_tag,
+        w = digits,
     )
 }
 
@@ -688,9 +724,9 @@ fn render_video_frame<W: Write>(
         None => {
             let load_pct = ready.load(Ordering::Relaxed) * 100 / n;
             let status = if done.load(Ordering::Relaxed) {
-                format!("  (frame {} unavailable)", current)
+                format!("  (frame {} unavailable) ", current)
             } else {
-                format!("  loading frame {}... {}%", current, load_pct)
+                format!("  loading frame {}... {:>3}% ", current, load_pct)
             };
             drop(guard);
             display_sixel(stdout, &[], 0, 0, cols, rows, Some(&status))?;
@@ -822,6 +858,32 @@ fn load_entries(cwd: &EntryPath) -> Vec<BrowserEntry> {
     entries
 }
 
+/// Recursively fast-forwards through directories that only contain a single subfolder
+/// and no other relevant image/video files.
+fn resolve_single_dir(mut target: EntryPath) -> EntryPath {
+    loop {
+        let sub_entries = load_entries(&target);
+        let mut real_count = 0;
+        let mut only_dir = None;
+
+        for entry in sub_entries {
+            if entry.name != ".." {
+                real_count += 1;
+                if entry.is_dir {
+                    only_dir = Some(entry.path);
+                }
+            }
+        }
+
+        if real_count == 1 && only_dir.is_some() {
+            target = only_dir.unwrap();
+        } else {
+            break;
+        }
+    }
+    target
+}
+
 fn show_browser<W: Write>(stdout: &mut W, start_path: EntryPath, max_colors: usize) -> Result<()> {
     let mut cwd = start_path;
     let mut selected = 0;
@@ -889,12 +951,14 @@ fn show_browser<W: Write>(stdout: &mut W, start_path: EntryPath, max_colors: usi
                 }
             }
 
-            let footer = " \u{2191}\u{2193} Navigate │ Enter View │ Backspace Up │ Esc Quit ";
+            let footer = " \u{2191}\u{2193} Nav │ Enter View │ \u{2190}/h Up │ Tab/Bksp Pg │ Space Last │ q Quit ";
             let _ = write!(
                 &mut buf,
-                "\x1b[{};1H\x1b[7m{:<width$}\x1b[0m\x1b[K",
+                "\x1b[{};1H\x1b[7m{:<width$}\x1b[0m\x1b[K\x1b[{};{}H",
                 rows,
                 footer,
+                rows,
+                cols,
                 width = cols as usize
             );
 
@@ -906,7 +970,7 @@ fn show_browser<W: Write>(stdout: &mut W, start_path: EntryPath, max_colors: usi
         if event::poll(Duration::from_millis(100))? {
             match event::read()? {
                 Event::Key(key) => match key.code {
-                    KeyCode::Char('q') | KeyCode::Esc => return Ok(()),
+                    KeyCode::Char('q') => return Ok(()),
                     KeyCode::Up | KeyCode::Char('k') => {
                         selected = selected.saturating_sub(1);
                         needs_redraw = true;
@@ -921,15 +985,17 @@ fn show_browser<W: Write>(stdout: &mut W, start_path: EntryPath, max_colors: usi
                         selected = 0;
                         needs_redraw = true;
                     }
-                    KeyCode::End => {
-                        selected = entries.len().saturating_sub(1);
-                        needs_redraw = true;
+                    KeyCode::End | KeyCode::Char(' ') => {
+                        if !entries.is_empty() {
+                            selected = entries.len().saturating_sub(1);
+                            needs_redraw = true;
+                        }
                     }
-                    KeyCode::PageUp => {
+                    KeyCode::PageUp | KeyCode::Backspace => {
                         selected = selected.saturating_sub(list_rows);
                         needs_redraw = true;
                     }
-                    KeyCode::PageDown => {
+                    KeyCode::PageDown | KeyCode::Tab => {
                         selected = (selected + list_rows).min(entries.len().saturating_sub(1));
                         needs_redraw = true;
                     }
@@ -937,7 +1003,11 @@ fn show_browser<W: Write>(stdout: &mut W, start_path: EntryPath, max_colors: usi
                         if !entries.is_empty() {
                             let entry = &entries[selected];
                             if entry.is_dir {
-                                cwd = entry.path.clone();
+                                if entry.name == ".." {
+                                    cwd = entry.path.clone();
+                                } else {
+                                    cwd = resolve_single_dir(entry.path.clone());
+                                }
                                 selected = 0;
                                 scroll = 0;
                                 needs_refresh = true;
@@ -957,7 +1027,20 @@ fn show_browser<W: Write>(stdout: &mut W, start_path: EntryPath, max_colors: usi
                                     let action = match action_res {
                                         Ok(a) => a,
                                         Err(e) => {
-                                            let _ = update_status_line(stdout, &format!("\x1b[7m\x1b[31m Error: {} \x1b[0m\x1b[K", e));
+                                            let (cols, rows) = terminal::size().unwrap_or((80, 24));
+                                            let err_msg = format!(" Error: {} ", e);
+                                            let mut err_buf = Vec::new();
+                                            let _ = write!(
+                                                &mut err_buf,
+                                                "\x1b[{};1H\x1b[7m\x1b[31m{:<width$}\x1b[0m\x1b[K\x1b[{};{}H",
+                                                rows,
+                                                err_msg,
+                                                rows,
+                                                cols,
+                                                width = cols as usize
+                                            );
+                                            let _ = stdout.write_all(&err_buf);
+                                            let _ = stdout.flush();
                                             std::thread::sleep(Duration::from_secs(2));
                                             ViewerAction::ReturnToBrowser
                                         }
@@ -1008,7 +1091,7 @@ fn show_browser<W: Write>(stdout: &mut W, start_path: EntryPath, max_colors: usi
                             }
                         }
                     }
-                    KeyCode::Backspace | KeyCode::Left | KeyCode::Char('h') => {
+                    KeyCode::Left | KeyCode::Char('h') => {
                         if let Some(parent_entry) = entries.iter().find(|e| e.name == "..").cloned() {
                             let prev_dir_name = match &cwd {
                                 EntryPath::Native(p) => p.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default(),
@@ -1084,6 +1167,7 @@ fn main() -> Result<()> {
         }
     }
 
+    start_path = resolve_single_dir(start_path);
     show_browser(&mut stdout, start_path, cli.colors)?;
 
     Ok(())
