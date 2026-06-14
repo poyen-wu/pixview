@@ -1,8 +1,10 @@
 mod ffmpeg;
 mod sixel;
 
+use std::collections::HashSet;
 use std::fs;
-use std::io::{self, Write};
+use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -45,18 +47,14 @@ const IMAGE_EXTENSIONS: &[&str] = &[
     "jpg", "jpeg", "png", "gif", "bmp", "ico", "tiff", "webp", "avif", "pnm", "tga",
 ];
 
-fn is_video(path: &Path) -> bool {
-    path.extension()
-        .and_then(|e| e.to_str())
-        .map(|e| VIDEO_EXTENSIONS.contains(&e.to_lowercase().as_str()))
-        .unwrap_or(false)
+fn is_video(name: &str) -> bool {
+    let ext = name.rsplit('.').next().unwrap_or("").to_lowercase();
+    VIDEO_EXTENSIONS.contains(&ext.as_str())
 }
 
-fn is_image(path: &Path) -> bool {
-    path.extension()
-        .and_then(|e| e.to_str())
-        .map(|e| IMAGE_EXTENSIONS.contains(&e.to_lowercase().as_str()))
-        .unwrap_or(false)
+fn is_image(name: &str) -> bool {
+    let ext = name.rsplit('.').next().unwrap_or("").to_lowercase();
+    IMAGE_EXTENSIONS.contains(&ext.as_str())
 }
 
 fn terminal_cell_size() -> (u32, u32) {
@@ -215,12 +213,160 @@ impl Drop for TermGuard {
     }
 }
 
+#[derive(Clone, Debug, PartialEq)]
+enum EntryPath {
+    Native(PathBuf),
+    InZip(PathBuf, String),
+}
+
+fn stream_zip_video(archive: PathBuf, name: String) -> (String, Arc<AtomicBool>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let stop_signal = Arc::new(AtomicBool::new(false));
+    let stop_clone = Arc::clone(&stop_signal);
+    listener.set_nonblocking(true).unwrap();
+
+    let mut total_size = 0;
+    let mut physical_data_start: Option<u64> = None;
+    let mut in_memory_cache: Option<Arc<Vec<u8>>> = None;
+
+    if let Ok(file) = std::fs::File::open(&archive) {
+        if let Ok(mut zip) = zip::ZipArchive::new(file) {
+            if let Ok(mut zfile) = zip.by_name(&name) {
+                total_size = zfile.size();
+                let is_stored = zfile.compression() == zip::CompressionMethod::Stored;
+
+                if is_stored {
+                    if let Some(ds) = zfile.data_start() {
+                        physical_data_start = Some(ds);
+                        // HARD CAP to prevent EOF crash if ZIP header size is padded
+                        if let Ok(meta) = std::fs::metadata(&archive) {
+                            let max_available = meta.len().saturating_sub(ds);
+                            total_size = total_size.min(max_available);
+                        }
+                    }
+                }
+
+                // Cache compressed files to RAM
+                if physical_data_start.is_none() {
+                    let mut buf = Vec::with_capacity(total_size as usize);
+                    let _ = std::io::copy(&mut zfile, &mut buf);
+                    total_size = buf.len() as u64; 
+                    in_memory_cache = Some(Arc::new(buf));
+                }
+            }
+        }
+    }
+
+    std::thread::spawn(move || {
+        while !stop_clone.load(Ordering::Relaxed) {
+            if let Ok((mut stream, _)) = listener.accept() {
+                // CRITICAL FIX: The accepted stream inherits the listener's non-blocking flag on Unix.
+                // We MUST make it blocking, otherwise it drops instantly and causes FFmpeg to 
+                // enter an infinite, 100% CPU reconnect loop.
+                let _ = stream.set_nonblocking(false);
+                let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+                let _ = stream.set_write_timeout(Some(Duration::from_secs(10)));
+
+                let archive = archive.clone();
+                let cache = in_memory_cache.clone();
+
+                std::thread::spawn(move || {
+                    let mut req_buf = Vec::new();
+                    let mut buf = [0; 1024];
+                    while let Ok(n) = stream.read(&mut buf) {
+                        if n == 0 { break; }
+                        req_buf.extend_from_slice(&buf[..n]);
+                        if req_buf.windows(4).any(|w| w == b"\r\n\r\n") { break; }
+                    }
+
+                    let req_str = String::from_utf8_lossy(&req_buf);
+                    if req_str.is_empty() || total_size == 0 { return; }
+
+                    let mut start_byte = 0;
+                    let mut end_byte_opt = None;
+                    let mut has_range = false;
+
+                    for line in req_str.lines() {
+                        let line_clean = line.to_lowercase().replace(" ", "");
+                        if line_clean.starts_with("range:bytes=") {
+                            has_range = true;
+                            if let Some(bytes_str) = line_clean.split("bytes=").nth(1) {
+                                let range_str = bytes_str.trim();
+                                if range_str.starts_with('-') {
+                                    if let Ok(suffix_len) = range_str[1..].parse::<u64>() {
+                                        start_byte = total_size.saturating_sub(suffix_len);
+                                        end_byte_opt = Some(total_size.saturating_sub(1));
+                                    }
+                                } else {
+                                    let parts: Vec<&str> = range_str.split('-').collect();
+                                    if let Ok(b) = parts[0].parse::<u64>() { start_byte = b; }
+                                    if parts.len() > 1 && !parts[1].is_empty() {
+                                        if let Ok(b) = parts[1].parse::<u64>() { end_byte_opt = Some(b); }
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    if start_byte >= total_size {
+                        let headers = format!("HTTP/1.1 416 Range Not Satisfiable\r\nContent-Range: bytes */{}\r\nConnection: close\r\n\r\n", total_size);
+                        let _ = stream.write_all(headers.as_bytes());
+                        return;
+                    }
+
+                    let end_byte = end_byte_opt.unwrap_or(total_size.saturating_sub(1)).min(total_size.saturating_sub(1));
+                    let content_length = end_byte.saturating_sub(start_byte) + 1;
+
+                    let headers = if has_range {
+                        format!("HTTP/1.1 206 Partial Content\r\nContent-Type: video/mp4\r\nContent-Range: bytes {}-{}/{}\r\nContent-Length: {}\r\nAccept-Ranges: bytes\r\nConnection: close\r\n\r\n", start_byte, end_byte, total_size, content_length)
+                    } else {
+                        format!("HTTP/1.1 200 OK\r\nContent-Type: video/mp4\r\nContent-Length: {}\r\nAccept-Ranges: bytes\r\nConnection: close\r\n\r\n", total_size)
+                    };
+
+                    if stream.write_all(headers.as_bytes()).is_ok() {
+                        if let Some(mem_buf) = &cache {
+                            let start_idx = start_byte as usize;
+                            let end_idx = (start_byte + content_length) as usize;
+                            if start_idx <= mem_buf.len() {
+                                let safe_end = end_idx.min(mem_buf.len());
+                                let _ = stream.write_all(&mem_buf[start_idx..safe_end]);
+                            }
+                        } else if let Some(ds) = physical_data_start {
+                            if let Ok(mut raw_file) = std::fs::File::open(&archive) {
+                                if raw_file.seek(SeekFrom::Start(ds + start_byte)).is_ok() {
+                                    let mut chunk = raw_file.take(content_length);
+                                    let _ = std::io::copy(&mut chunk, &mut stream);
+                                }
+                            }
+                        }
+                    }
+                });
+            } else {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+    });
+
+    (format!("http://127.0.0.1:{}/vid.mp4", port), stop_signal)
+}
+
 fn show_image<W: Write>(
     stdout: &mut W,
-    path: &Path,
+    path: &EntryPath,
     max_colors: usize,
 ) -> Result<ViewerAction> {
-    let img = image::open(path)?;
+    let img = match path {
+        EntryPath::Native(p) => image::open(p)?,
+        EntryPath::InZip(arc, name) => {
+            let file = fs::File::open(arc)?;
+            let mut zip = zip::ZipArchive::new(file)?;
+            let mut zfile = zip.by_name(name)?;
+            let mut buf = Vec::new();
+            zfile.read_to_end(&mut buf)?;
+            image::load_from_memory(&buf)?
+        }
+    };
 
     let mut mode = DisplayMode::Fit;
     let (cols, rows) = terminal::size()?;
@@ -283,10 +429,18 @@ fn show_image<W: Write>(
 
 fn show_video<W: Write>(
     stdout: &mut W,
-    path: &Path,
+    path: &EntryPath,
     max_colors: usize,
 ) -> Result<ViewerAction> {
-    let duration = ffmpeg::get_duration(path)?;
+    let (vid_path_str, stop_server) = match path {
+        EntryPath::Native(p) => (p.to_string_lossy().to_string(), None),
+        EntryPath::InZip(arc, name) => {
+            let (url, stop) = stream_zip_video(arc.clone(), name.clone());
+            (url, Some(stop))
+        }
+    };
+
+    let duration = ffmpeg::get_duration(&vid_path_str)?;
 
     let n_frames = 101;
     let timestamps: Vec<f64> = (0..n_frames)
@@ -300,7 +454,7 @@ fn show_video<W: Write>(
         })
         .collect();
 
-    let first = ffmpeg::extract_frame(path, timestamps[0])?;
+    let first = ffmpeg::extract_frame(&vid_path_str, timestamps[0])?;
 
     let frames: Arc<Mutex<Vec<Option<DynamicImage>>>> =
         Arc::new(Mutex::new(vec![None; n_frames]));
@@ -311,7 +465,7 @@ fn show_video<W: Write>(
     let cancel = Arc::new(AtomicBool::new(false));
 
     ffmpeg::spawn_frame_extractor(
-        path,
+        vid_path_str.clone(),
         timestamps.clone(),
         Arc::clone(&frames),
         Arc::clone(&ready),
@@ -448,7 +602,7 @@ fn show_video<W: Write>(
                 let status = if done.load(Ordering::Relaxed) {
                     format!("  (frame {} unavailable)", current)
                 } else {
-                    format!("  loading frame {}... ({}%)", current, load_pct)
+                    format!("  loading frame {}... {}%", current, load_pct)
                 };
                 drop(guard);
                 update_status_line(stdout, &status)?;
@@ -457,6 +611,10 @@ fn show_video<W: Write>(
     };
 
     cancel.store(true, Ordering::Relaxed);
+    if let Some(stop) = stop_server {
+        stop.store(true, Ordering::Relaxed);
+    }
+    
     Ok(action)
 }
 
@@ -532,7 +690,7 @@ fn render_video_frame<W: Write>(
             let status = if done.load(Ordering::Relaxed) {
                 format!("  (frame {} unavailable)", current)
             } else {
-                format!("  loading frame {}... ({}%)", current, load_pct)
+                format!("  loading frame {}... {}%", current, load_pct)
             };
             drop(guard);
             display_sixel(stdout, &[], 0, 0, cols, rows, Some(&status))?;
@@ -543,31 +701,109 @@ fn render_video_frame<W: Write>(
 
 #[derive(Clone)]
 struct BrowserEntry {
-    path: PathBuf,
+    path: EntryPath,
     name: String,
     is_dir: bool,
 }
 
-fn load_entries(dir: &Path) -> Vec<BrowserEntry> {
+fn load_entries(cwd: &EntryPath) -> Vec<BrowserEntry> {
     let mut entries = Vec::new();
-    if let Some(parent) = dir.parent() {
-        entries.push(BrowserEntry {
-            path: parent.to_path_buf(),
-            name: "..".to_string(),
-            is_dir: true,
-        });
-    }
 
-    if let Ok(rd) = fs::read_dir(dir) {
-        for entry in rd.flatten() {
-            let path = entry.path();
-            let is_dir = path.is_dir();
-            if is_dir || is_video(&path) || is_image(&path) {
+    match cwd {
+        EntryPath::Native(dir) => {
+            if let Some(parent) = dir.parent() {
                 entries.push(BrowserEntry {
-                    path,
-                    name: entry.file_name().to_string_lossy().into_owned(),
-                    is_dir,
+                    path: EntryPath::Native(parent.to_path_buf()),
+                    name: "..".to_string(),
+                    is_dir: true,
                 });
+            }
+
+            if let Ok(rd) = fs::read_dir(dir) {
+                for entry in rd.flatten() {
+                    let path = entry.path();
+                    let name = entry.file_name().to_string_lossy().into_owned();
+                    let is_zip = name.to_lowercase().ends_with(".zip");
+                    let is_dir = path.is_dir() || is_zip;
+
+                    if is_dir || is_video(&name) || is_image(&name) {
+                        let ep = if is_zip {
+                            EntryPath::InZip(path, String::new())
+                        } else {
+                            EntryPath::Native(path)
+                        };
+                        entries.push(BrowserEntry { path: ep, name, is_dir });
+                    }
+                }
+            }
+        }
+        EntryPath::InZip(archive, prefix) => {
+            if prefix.is_empty() {
+                if let Some(parent) = archive.parent() {
+                    entries.push(BrowserEntry {
+                        path: EntryPath::Native(parent.to_path_buf()),
+                        name: "..".to_string(),
+                        is_dir: true,
+                    });
+                }
+            } else {
+                let mut parts: Vec<&str> = prefix.trim_end_matches('/').split('/').collect();
+                parts.pop();
+                let parent_prefix = if parts.is_empty() {
+                    String::new()
+                } else {
+                    format!("{}/", parts.join("/"))
+                };
+                entries.push(BrowserEntry {
+                    path: EntryPath::InZip(archive.clone(), parent_prefix),
+                    name: "..".to_string(),
+                    is_dir: true,
+                });
+            }
+
+            if let Ok(file) = fs::File::open(archive) {
+                if let Ok(mut zip) = zip::ZipArchive::new(file) {
+                    let mut seen_dirs = HashSet::new();
+                    for i in 0..zip.len() {
+                        if let Ok(zfile) = zip.by_index(i) {
+                            let name = zfile.name();
+                            if !name.starts_with(prefix) || name == prefix {
+                                continue;
+                            }
+
+                            let remainder = &name[prefix.len()..];
+                            if let Some(slash_idx) = remainder.find('/') {
+                                let dir_name = &remainder[..slash_idx];
+                                if !seen_dirs.contains(dir_name) {
+                                    seen_dirs.insert(dir_name.to_string());
+                                    entries.push(BrowserEntry {
+                                        path: EntryPath::InZip(
+                                            archive.clone(),
+                                            format!("{}{}/", prefix, dir_name),
+                                        ),
+                                        name: dir_name.to_string(),
+                                        is_dir: true,
+                                    });
+                                }
+                            } else {
+                                // Exclude nested ZIPs directly.
+                                if name.to_lowercase().ends_with(".zip") {
+                                    continue;
+                                }
+                                if is_video(remainder) || is_image(remainder) {
+                                    entries.push(BrowserEntry {
+                                        path: EntryPath::InZip(
+                                            archive.clone(),
+                                            name.to_string(),
+                                        ),
+                                        name: remainder.to_string(),
+                                        is_dir: false,
+                                    });
+                                }
+                            }
+                        }
+                    }
+                }
             }
         }
     }
@@ -586,18 +822,12 @@ fn load_entries(dir: &Path) -> Vec<BrowserEntry> {
     entries
 }
 
-fn show_browser<W: Write>(stdout: &mut W, start_path: &Path, max_colors: usize) -> Result<()> {
-    let mut cwd = start_path
-        .canonicalize()
-        .unwrap_or_else(|_| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
-
-    if cwd.is_file() {
-        cwd.pop();
-    }
-
+fn show_browser<W: Write>(stdout: &mut W, start_path: EntryPath, max_colors: usize) -> Result<()> {
+    let mut cwd = start_path;
     let mut selected = 0;
     let mut scroll = 0;
     let mut needs_refresh = true;
+    let mut needs_redraw = true;
     let mut entries = Vec::new();
 
     loop {
@@ -607,6 +837,7 @@ fn show_browser<W: Write>(stdout: &mut W, start_path: &Path, max_colors: usize) 
                 selected = entries.len().saturating_sub(1);
             }
             needs_refresh = false;
+            needs_redraw = true;
         }
 
         let (cols, rows) = terminal::size()?;
@@ -614,54 +845,63 @@ fn show_browser<W: Write>(stdout: &mut W, start_path: &Path, max_colors: usize) 
 
         if selected < scroll {
             scroll = selected;
+            needs_redraw = true;
         }
         if selected >= scroll + list_rows {
             scroll = selected.saturating_sub(list_rows - 1);
+            needs_redraw = true;
         }
 
-        let mut buf = Vec::with_capacity(4096);
-        let _ = write!(&mut buf, "\x1b[H\x1b[2J");
-        let header = format!(" Browser: {} ", cwd.display());
-        let _ = write!(
-            &mut buf,
-            "\x1b[1;1H\x1b[7m{:<width$}\x1b[0m\x1b[K\r\n",
-            header,
-            width = cols as usize
-        );
+        if needs_redraw {
+            let mut buf = Vec::with_capacity(4096);
+            let _ = write!(&mut buf, "\x1b[H\x1b[2J");
+            let header = match &cwd {
+                EntryPath::Native(p) => format!(" Browser: {} ", p.display()),
+                EntryPath::InZip(arc, prefix) => format!(" Browser: {}/{} ", arc.display(), prefix),
+            };
+            
+            let _ = write!(
+                &mut buf,
+                "\x1b[1;1H\x1b[7m{:<width$}\x1b[0m\x1b[K\r\n",
+                header,
+                width = cols as usize
+            );
 
-        for i in 0..list_rows {
-            let idx = scroll + i;
-            if idx < entries.len() {
-                let entry = &entries[idx];
-                let type_tag = if entry.is_dir {
-                    "DIR"
-                } else if is_video(&entry.path) {
-                    "VID"
-                } else {
-                    "IMG"
-                };
+            for i in 0..list_rows {
+                let idx = scroll + i;
+                if idx < entries.len() {
+                    let entry = &entries[idx];
+                    let type_tag = if entry.is_dir {
+                        "DIR"
+                    } else if is_video(&entry.name) {
+                        "VID"
+                    } else {
+                        "IMG"
+                    };
 
-                if idx == selected {
-                    let _ = write!(&mut buf, "\x1b[7m> [{}] {} \x1b[0m\x1b[K\r\n", type_tag, entry.name);
+                    if idx == selected {
+                        let _ = write!(&mut buf, "\x1b[7m> [{}] {} \x1b[0m\x1b[K\r\n", type_tag, entry.name);
+                    } else {
+                        let _ = write!(&mut buf, "  [{}] {} \x1b[K\r\n", type_tag, entry.name);
+                    }
                 } else {
-                    let _ = write!(&mut buf, "  [{}] {} \x1b[K\r\n", type_tag, entry.name);
+                    let _ = write!(&mut buf, "\x1b[K\r\n");
                 }
-            } else {
-                let _ = write!(&mut buf, "\x1b[K\r\n");
             }
+
+            let footer = " \u{2191}\u{2193} Navigate │ Enter View │ Backspace Up │ Esc Quit ";
+            let _ = write!(
+                &mut buf,
+                "\x1b[{};1H\x1b[7m{:<width$}\x1b[0m\x1b[K",
+                rows,
+                footer,
+                width = cols as usize
+            );
+
+            stdout.write_all(&buf)?;
+            stdout.flush()?;
+            needs_redraw = false;
         }
-
-        let footer = " \u{2191}\u{2193} Navigate │ Enter View │ Backspace Up │ Esc Quit ";
-        let _ = write!(
-            &mut buf,
-            "\x1b[{};1H\x1b[7m{:<width$}\x1b[0m\x1b[K",
-            rows,
-            footer,
-            width = cols as usize
-        );
-
-        stdout.write_all(&buf)?;
-        stdout.flush()?;
 
         if event::poll(Duration::from_millis(100))? {
             match event::read()? {
@@ -669,17 +909,29 @@ fn show_browser<W: Write>(stdout: &mut W, start_path: &Path, max_colors: usize) 
                     KeyCode::Char('q') | KeyCode::Esc => return Ok(()),
                     KeyCode::Up | KeyCode::Char('k') => {
                         selected = selected.saturating_sub(1);
+                        needs_redraw = true;
                     }
                     KeyCode::Down | KeyCode::Char('j') => {
                         if selected + 1 < entries.len() {
                             selected += 1;
+                            needs_redraw = true;
                         }
                     }
-                    KeyCode::Home => selected = 0,
-                    KeyCode::End => selected = entries.len().saturating_sub(1),
-                    KeyCode::PageUp => selected = selected.saturating_sub(list_rows),
+                    KeyCode::Home => {
+                        selected = 0;
+                        needs_redraw = true;
+                    }
+                    KeyCode::End => {
+                        selected = entries.len().saturating_sub(1);
+                        needs_redraw = true;
+                    }
+                    KeyCode::PageUp => {
+                        selected = selected.saturating_sub(list_rows);
+                        needs_redraw = true;
+                    }
                     KeyCode::PageDown => {
-                        selected = (selected + list_rows).min(entries.len().saturating_sub(1))
+                        selected = (selected + list_rows).min(entries.len().saturating_sub(1));
+                        needs_redraw = true;
                     }
                     KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => {
                         if !entries.is_empty() {
@@ -689,13 +941,14 @@ fn show_browser<W: Write>(stdout: &mut W, start_path: &Path, max_colors: usize) 
                                 selected = 0;
                                 scroll = 0;
                                 needs_refresh = true;
+                                needs_redraw = true;
                             } else {
                                 let mut current_idx = selected;
                                 loop {
                                     let view_entry = &entries[current_idx];
-                                    let action_res = if is_video(&view_entry.path) {
+                                    let action_res = if is_video(&view_entry.name) {
                                         show_video(stdout, &view_entry.path, max_colors)
-                                    } else if is_image(&view_entry.path) {
+                                    } else if is_image(&view_entry.name) {
                                         show_image(stdout, &view_entry.path, max_colors)
                                     } else {
                                         Ok(ViewerAction::ReturnToBrowser)
@@ -715,6 +968,7 @@ fn show_browser<W: Write>(stdout: &mut W, start_path: &Path, max_colors: usize) 
                                         ViewerAction::ReturnToBrowser => {
                                             selected = current_idx;
                                             needs_refresh = true;
+                                            needs_redraw = true;
                                             break;
                                         }
                                         ViewerAction::NextFile => {
@@ -728,6 +982,7 @@ fn show_browser<W: Write>(stdout: &mut W, start_path: &Path, max_colors: usize) 
                                             if next_idx == current_idx {
                                                 selected = current_idx;
                                                 needs_refresh = true;
+                                                needs_redraw = true;
                                                 break;
                                             }
                                             current_idx = next_idx;
@@ -743,6 +998,7 @@ fn show_browser<W: Write>(stdout: &mut W, start_path: &Path, max_colors: usize) 
                                             if prev_idx == current_idx {
                                                 selected = current_idx;
                                                 needs_refresh = true;
+                                                needs_redraw = true;
                                                 break;
                                             }
                                             current_idx = prev_idx;
@@ -753,21 +1009,28 @@ fn show_browser<W: Write>(stdout: &mut W, start_path: &Path, max_colors: usize) 
                         }
                     }
                     KeyCode::Backspace | KeyCode::Left | KeyCode::Char('h') => {
-                        if let Some(parent) = cwd.parent() {
-                            let prev_dir_name = cwd
-                                .file_name()
-                                .map(|s| s.to_string_lossy().into_owned())
-                                .unwrap_or_default();
-                            cwd = parent.to_path_buf();
+                        if let Some(parent_entry) = entries.iter().find(|e| e.name == "..").cloned() {
+                            let prev_dir_name = match &cwd {
+                                EntryPath::Native(p) => p.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default(),
+                                EntryPath::InZip(arc, prefix) => {
+                                    if prefix.is_empty() {
+                                        arc.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default()
+                                    } else {
+                                        let trimmed = prefix.trim_end_matches('/');
+                                        trimmed.split('/').last().unwrap_or("").to_string()
+                                    }
+                                }
+                            };
 
+                            cwd = parent_entry.path;
                             entries = load_entries(&cwd);
-                            selected = entries
-                                .iter()
-                                .position(|e| e.name == prev_dir_name)
-                                .unwrap_or(0);
-
+                            
+                            // Scan the parent and re-select the folder we just came from
+                            selected = entries.iter().position(|e| e.name == prev_dir_name).unwrap_or(0);
+                            
                             scroll = 0;
                             needs_refresh = false;
+                            needs_redraw = true;
                         }
                     }
                     KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
@@ -775,7 +1038,9 @@ fn show_browser<W: Write>(stdout: &mut W, start_path: &Path, max_colors: usize) 
                     }
                     _ => {}
                 },
-                Event::Resize(_, _) => {}
+                Event::Resize(_, _) => {
+                    needs_redraw = true;
+                }
                 _ => {}
             }
         }
@@ -786,22 +1051,40 @@ fn main() -> Result<()> {
     ffmpeg::init()?;
 
     let cli = Cli::parse();
+    
     let path = Path::new(&cli.path);
+    let abs_path = path.canonicalize().unwrap_or_else(|_| PathBuf::from(&cli.path));
+    
+    let is_zip_ext = abs_path.extension().map_or(false, |e| e.eq_ignore_ascii_case("zip"));
+    
+    let mut start_path = if abs_path.is_file() {
+        if is_zip_ext {
+            EntryPath::InZip(abs_path.clone(), String::new())
+        } else {
+            EntryPath::Native(abs_path)
+        }
+    } else {
+        EntryPath::Native(abs_path)
+    };
 
     terminal::enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen)?;
     let _guard = TermGuard;
 
-    if path.is_file() {
-        if is_video(path) {
-            let _ = show_video(&mut stdout, path, cli.colors);
-        } else {
-            let _ = show_image(&mut stdout, path, cli.colors);
+    if let EntryPath::Native(p) = &mut start_path {
+        if p.is_file() && !is_zip_ext {
+            let file_name = p.file_name().unwrap_or_default().to_string_lossy();
+            if is_video(&file_name) {
+                let _ = show_video(&mut stdout, &EntryPath::Native(p.clone()), cli.colors);
+            } else {
+                let _ = show_image(&mut stdout, &EntryPath::Native(p.clone()), cli.colors);
+            }
+            return Ok(());
         }
-    } else {
-        show_browser(&mut stdout, path, cli.colors)?;
     }
+
+    show_browser(&mut stdout, start_path, cli.colors)?;
 
     Ok(())
 }

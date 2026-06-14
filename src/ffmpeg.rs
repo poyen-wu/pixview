@@ -11,11 +11,14 @@ use ffmpeg::software::scaling::{context::Context as Scaler, flag::Flags};
 use ffmpeg::util::color::Range;
 
 pub fn init() -> Result<()> {
-    ffmpeg::init().map_err(|e| anyhow::anyhow!("Failed to initialize ffmpeg: {}", e))
+    ffmpeg::init().map_err(|e| anyhow::anyhow!("Failed to initialize ffmpeg: {}", e))?;
+    ffmpeg::format::network::init(); 
+    ffmpeg::log::set_level(ffmpeg::log::Level::Quiet);
+    Ok(())
 }
 
-pub fn get_duration(path: &Path) -> Result<f64> {
-    let ictx = ffmpeg::format::input(&path)?;
+pub fn get_duration(path: &str) -> Result<f64> {
+    let ictx = ffmpeg::format::input(&Path::new(path))?;
     let stream = ictx
         .streams()
         .best(ffmpeg::media::Type::Video)
@@ -40,7 +43,7 @@ fn configure_scaler_range(scaler: &mut Scaler, decoded: &ffmpeg::frame::Video) {
             _ => 0,
         };
 
-        let dst_range = 1; // RGB is full-range
+        let dst_range = 1;
 
         let table = ffmpeg::ffi::sws_getCoefficients(ffmpeg::ffi::SWS_CS_DEFAULT);
 
@@ -167,8 +170,8 @@ fn video_frame_to_image(decoded: &ffmpeg::frame::Video) -> Result<DynamicImage> 
     Ok(rgb_frame_to_image(&rgb_frame))
 }
 
-pub fn extract_frame(path: &Path, timestamp_sec: f64) -> Result<DynamicImage> {
-    let mut ictx = ffmpeg::format::input(path)?;
+pub fn extract_frame(path: &str, timestamp_sec: f64) -> Result<DynamicImage> {
+    let mut ictx = ffmpeg::format::input(&Path::new(path))?;
     let stream = ictx
         .streams()
         .best(ffmpeg::media::Type::Video)
@@ -194,7 +197,9 @@ pub fn extract_frame(path: &Path, timestamp_sec: f64) -> Result<DynamicImage> {
     let mut decoded = ffmpeg::frame::Video::empty();
     let mut first_decodable: Option<DynamicImage> = None;
     let mut best_before: Option<DynamicImage> = None;
+    
     let mut read_packets = 0usize;
+    let mut decoded_frames = 0usize;
 
     for (s, packet) in ictx.packets() {
         if s.index() != stream_idx {
@@ -205,6 +210,7 @@ pub fn extract_frame(path: &Path, timestamp_sec: f64) -> Result<DynamicImage> {
         decoder.send_packet(&packet)?;
 
         while decoder.receive_frame(&mut decoded).is_ok() {
+            decoded_frames += 1;
             let img = video_frame_to_image(&decoded)?;
 
             if first_decodable.is_none() {
@@ -217,7 +223,8 @@ pub fn extract_frame(path: &Path, timestamp_sec: f64) -> Result<DynamicImage> {
                     .map(|pts| pts as f64 * time_base_f)
                     .unwrap_or(0.0);
 
-                if frame_sec <= 1.0 && !is_probably_black(&img) {
+                // FIX 1: If PTS is missing, stop checking after 20 frames to prevent 100% CPU lockups
+                if (frame_sec <= 1.0 && !is_probably_black(&img)) || decoded_frames > 20 {
                     return Ok(img);
                 }
 
@@ -225,8 +232,10 @@ pub fn extract_frame(path: &Path, timestamp_sec: f64) -> Result<DynamicImage> {
                 continue;
             }
 
+            // FIX 2: Handle missing PTS after a physical seek
             match decoded.pts() {
                 Some(frame_pts) if frame_pts >= target_pts => return Ok(img),
+                None => return Ok(img), // PTS is missing. The demuxer seeked close enough, just take it!
                 _ => best_before = Some(img),
             }
         }
@@ -238,6 +247,7 @@ pub fn extract_frame(path: &Path, timestamp_sec: f64) -> Result<DynamicImage> {
 
     decoder.send_eof()?;
     while decoder.receive_frame(&mut decoded).is_ok() {
+        decoded_frames += 1;
         let img = video_frame_to_image(&decoded)?;
 
         if timestamp_sec <= 0.5 {
@@ -246,7 +256,7 @@ pub fn extract_frame(path: &Path, timestamp_sec: f64) -> Result<DynamicImage> {
                 .map(|pts| pts as f64 * time_base_f)
                 .unwrap_or(0.0);
 
-            if frame_sec <= 1.0 && !is_probably_black(&img) {
+            if (frame_sec <= 1.0 && !is_probably_black(&img)) || decoded_frames > 20 {
                 return Ok(img);
             }
 
@@ -256,6 +266,7 @@ pub fn extract_frame(path: &Path, timestamp_sec: f64) -> Result<DynamicImage> {
 
         match decoded.pts() {
             Some(frame_pts) if frame_pts >= target_pts => return Ok(img),
+            None => return Ok(img),
             _ => best_before = Some(img),
         }
     }
@@ -265,11 +276,8 @@ pub fn extract_frame(path: &Path, timestamp_sec: f64) -> Result<DynamicImage> {
         .ok_or_else(|| anyhow::anyhow!("ffmpeg produced no decodable video frame"))
 }
 
-/// Spawns a background thread that progressively decodes video frames at the
-/// given timestamps, filling `frames` in place and signaling progress via the
-/// shared atomics.
 pub fn spawn_frame_extractor(
-    path: &Path,
+    path: String,
     timestamps: Vec<f64>,
     frames: Arc<Mutex<Vec<Option<DynamicImage>>>>,
     ready: Arc<AtomicUsize>,
@@ -277,10 +285,9 @@ pub fn spawn_frame_extractor(
     cancel: Arc<AtomicBool>,
 ) {
     let n_frames = timestamps.len();
-    let path = path.to_path_buf();
 
     std::thread::spawn(move || {
-        let mut ictx = match ffmpeg::format::input(&path) {
+        let mut ictx = match ffmpeg::format::input(&Path::new(&path)) {
             Ok(c) => c,
             Err(_) => {
                 done.store(true, Ordering::Relaxed);
@@ -298,6 +305,10 @@ pub fn spawn_frame_extractor(
 
         let stream_idx = stream.index();
         let time_base_f = f64::from(stream.time_base());
+        
+        // Calculate a safe fallback frame duration (e.g. 1 / 25fps = 0.04s) for missing PTS
+        let fps = f64::from(stream.avg_frame_rate());
+        let fallback_dur = if fps > 0.0 && fps.is_finite() { 1.0 / fps } else { time_base_f };
 
         let context = match ffmpeg::codec::context::Context::from_parameters(stream.parameters()) {
             Ok(c) => c,
@@ -321,96 +332,135 @@ pub fn spawn_frame_extractor(
 
         let mut decoded = ffmpeg::frame::Video::empty();
         let mut rgb_frame = ffmpeg::frame::Video::empty();
-
         let mut scaler_opt: Option<Scaler> = None;
         let mut current_fmt = Pixel::None;
         let mut current_w = 0;
         let mut current_h = 0;
 
-        for batch in 0..10 {
-            if cancel.load(Ordering::Relaxed) {
-                break;
-            }
+        let is_http = path.starts_with("http");
 
-            let start = if batch == 0 { 10 } else { batch };
-            let mut i = start;
+        if is_http {
+            let mut current_idx = 1;
+            let mut first_sec: Option<f64> = None;
+            let mut frame_counter = 0u64; // Fallback tracker for missing PTS
+            
+            for (s, packet) in ictx.packets() {
+                if cancel.load(Ordering::Relaxed) || current_idx >= n_frames { break; }
 
-            while i < n_frames {
-                if cancel.load(Ordering::Relaxed) {
-                    break;
-                }
+                if s.index() == stream_idx {
+                    if decoder.send_packet(&packet).is_ok() {
+                        while decoder.receive_frame(&mut decoded).is_ok() {
+                            
+                            // FIX 3: Calculate timeline securely, even if the file is an AVI packed bitstream
+                            let frame_sec = if let Some(pts) = decoded.pts() {
+                                pts as f64 * time_base_f
+                            } else {
+                                frame_counter as f64 * fallback_dur
+                            };
+                            frame_counter += 1;
+                            
+                            if first_sec.is_none() { first_sec = Some(frame_sec); }
+                            let normalized_sec = frame_sec - first_sec.unwrap();
 
-                if !loaded[i] {
-                    let ts_sec = timestamps[i];
-
-                    let target_pts = if time_base_f > 0.0 && time_base_f.is_finite() {
-                        (ts_sec / time_base_f) as i64
-                    } else {
-                        0
-                    };
-
-                    let ts = (ts_sec * ffmpeg::ffi::AV_TIME_BASE as f64) as i64;
-
-                    if ictx.seek(ts, ..).is_ok() {
-                        decoder.flush();
-                        let mut extracted = false;
-                        let mut read_packets = 0;
-
-                        for (s, packet) in ictx.packets() {
-                            if s.index() == stream_idx {
-                                read_packets += 1;
-
-                                if decoder.send_packet(&packet).is_ok() {
-                                    while decoder.receive_frame(&mut decoded).is_ok() {
-                                        let frame_pts = decoded.pts().unwrap_or(target_pts);
-
-                                        if frame_pts < target_pts {
-                                            continue;
-                                        }
-
-                                        if current_fmt != decoded.format()
-                                            || current_w != decoded.width()
-                                            || current_h != decoded.height()
-                                        {
-                                            current_fmt = decoded.format();
-                                            current_w = decoded.width();
-                                            current_h = decoded.height();
-                                            scaler_opt = Scaler::get(
-                                                current_fmt,
-                                                current_w,
-                                                current_h,
-                                                Pixel::RGB24,
-                                                current_w,
-                                                current_h,
-                                                Flags::BILINEAR,
-                                            )
-                                            .ok();
-                                        }
-
-                                        if let Some(scaler) = scaler_opt.as_mut() {
-                                            if scaler.run(&decoded, &mut rgb_frame).is_ok() {
-                                                let img = rgb_frame_to_image(&rgb_frame);
-                                                frames.lock().unwrap()[i] = Some(img);
-                                                loaded[i] = true;
-                                                loaded_count += 1;
-                                                ready.store(loaded_count, Ordering::Relaxed);
-                                                extracted = true;
-                                                break;
-                                            }
+                            while current_idx < n_frames {
+                                let target_ts = timestamps[current_idx];
+                                
+                                if normalized_sec >= target_ts {
+                                    if current_fmt != decoded.format() || current_w != decoded.width() || current_h != decoded.height() {
+                                        current_fmt = decoded.format(); current_w = decoded.width(); current_h = decoded.height();
+                                        scaler_opt = Scaler::get(current_fmt, current_w, current_h, Pixel::RGB24, current_w, current_h, Flags::BILINEAR).ok();
+                                    }
+                                    if let Some(scaler) = scaler_opt.as_mut() {
+                                        if scaler.run(&decoded, &mut rgb_frame).is_ok() {
+                                            let img = rgb_frame_to_image(&rgb_frame);
+                                            frames.lock().unwrap()[current_idx] = Some(img);
+                                            loaded[current_idx] = true;
+                                            loaded_count += 1;
+                                            ready.store(loaded_count, Ordering::Relaxed);
                                         }
                                     }
+                                    current_idx += 1;
+                                } else {
+                                    break; 
                                 }
-                            }
-
-                            if extracted || read_packets > 300 {
-                                break;
                             }
                         }
                     }
                 }
-                i += 10;
+            }
+        } else {
+            // NATIVE LOCAL MODE
+            for batch in 0..10 {
+                let start = if batch == 0 { 10 } else { batch };
+                let mut i = start;
+                while i < n_frames {
+                    if cancel.load(Ordering::Relaxed) { break; }
+                    if !loaded[i] {
+                        let ts_sec = timestamps[i];
+                        let target_pts = if time_base_f > 0.0 { (ts_sec / time_base_f) as i64 } else { 0 };
+                        let ts = (ts_sec * ffmpeg::ffi::AV_TIME_BASE as f64) as i64;
+
+                        if ictx.seek(ts, ..).is_ok() {
+                            decoder.flush();
+                            let mut extracted = false;
+                            let mut read_packets = 0;
+
+                            for (s, packet) in ictx.packets() {
+                                if s.index() == stream_idx {
+                                    read_packets += 1;
+                                    if decoder.send_packet(&packet).is_ok() {
+                                        while decoder.receive_frame(&mut decoded).is_ok() {
+                                            // FIX 4: Handle missing PTS in local mode
+                                            let should_extract = match decoded.pts() {
+                                                Some(pts) => pts >= target_pts,
+                                                None => true, 
+                                            };
+
+                                            if !should_extract { continue; }
+
+                                            if current_fmt != decoded.format() || current_w != decoded.width() || current_h != decoded.height() {
+                                                current_fmt = decoded.format(); current_w = decoded.width(); current_h = decoded.height();
+                                                scaler_opt = Scaler::get(current_fmt, current_w, current_h, Pixel::RGB24, current_w, current_h, Flags::BILINEAR).ok();
+                                            }
+
+                                            if let Some(scaler) = scaler_opt.as_mut() {
+                                                if scaler.run(&decoded, &mut rgb_frame).is_ok() {
+                                                    let img = rgb_frame_to_image(&rgb_frame);
+                                                    frames.lock().unwrap()[i] = Some(img);
+                                                    loaded[i] = true;
+                                                    loaded_count += 1;
+                                                    ready.store(loaded_count, Ordering::Relaxed);
+                                                    extracted = true;
+                                                    break;
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                if extracted || read_packets > 300 { break; }
+                            }
+                        }
+                    }
+                    i += 10;
+                }
             }
         }
+        
+        // BACKFILL missing frames (handles standard container duration mismatches)
+        if !cancel.load(Ordering::Relaxed) && loaded_count < n_frames {
+            let mut guard = frames.lock().unwrap();
+            let mut last_good = None;
+            for i in 0..n_frames {
+                if guard[i].is_some() {
+                    last_good = guard[i].clone();
+                } else if last_good.is_some() {
+                    guard[i] = last_good.clone();
+                }
+            }
+            drop(guard);
+            ready.store(n_frames, Ordering::Relaxed);
+        }
+
         done.store(true, Ordering::Relaxed);
     });
 }
