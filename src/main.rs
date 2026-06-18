@@ -1,10 +1,9 @@
+mod archive;
 mod ffmpeg;
 mod sixel;
 
-use std::collections::HashSet;
 use std::fs;
-use std::io::{self, Read, Seek, SeekFrom, Write};
-use std::net::TcpListener;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -18,6 +17,8 @@ use crossterm::{
     terminal::{self, EnterAlternateScreen, LeaveAlternateScreen},
 };
 use image::DynamicImage;
+
+use archive::{ArchiveType, EntryPath};
 
 #[derive(Parser)]
 #[command(name = "pixview", about = "Display images and video thumbnails using sixel")]
@@ -222,144 +223,6 @@ impl Drop for TermGuard {
     }
 }
 
-#[derive(Clone, Debug, PartialEq)]
-enum EntryPath {
-    Native(PathBuf),
-    InZip(PathBuf, String),
-}
-
-fn stream_zip_video(archive: PathBuf, name: String) -> (String, Arc<AtomicBool>) {
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let port = listener.local_addr().unwrap().port();
-    let stop_signal = Arc::new(AtomicBool::new(false));
-    let stop_clone = Arc::clone(&stop_signal);
-    listener.set_nonblocking(true).unwrap();
-
-    let mut total_size = 0;
-    let mut physical_data_start: Option<u64> = None;
-    let mut in_memory_cache: Option<Arc<Vec<u8>>> = None;
-
-    if let Ok(file) = std::fs::File::open(&archive) {
-        if let Ok(mut zip) = zip::ZipArchive::new(file) {
-            if let Ok(mut zfile) = zip.by_name(&name) {
-                total_size = zfile.size();
-                let is_stored = zfile.compression() == zip::CompressionMethod::Stored;
-
-                if is_stored {
-                    if let Some(ds) = zfile.data_start() {
-                        physical_data_start = Some(ds);
-                        // HARD CAP to prevent EOF crash if ZIP header size is padded
-                        if let Ok(meta) = std::fs::metadata(&archive) {
-                            let max_available = meta.len().saturating_sub(ds);
-                            total_size = total_size.min(max_available);
-                        }
-                    }
-                }
-
-                // Cache compressed files to RAM
-                if physical_data_start.is_none() {
-                    let mut buf = Vec::with_capacity(total_size as usize);
-                    let _ = std::io::copy(&mut zfile, &mut buf);
-                    total_size = buf.len() as u64; 
-                    in_memory_cache = Some(Arc::new(buf));
-                }
-            }
-        }
-    }
-
-    std::thread::spawn(move || {
-        while !stop_clone.load(Ordering::Relaxed) {
-            if let Ok((mut stream, _)) = listener.accept() {
-                // CRITICAL FIX: The accepted stream inherits the listener's non-blocking flag on Unix.
-                // We MUST make it blocking, otherwise it drops instantly and causes FFmpeg to 
-                // enter an infinite, 100% CPU reconnect loop.
-                let _ = stream.set_nonblocking(false);
-                let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
-                let _ = stream.set_write_timeout(Some(Duration::from_secs(10)));
-
-                let archive = archive.clone();
-                let cache = in_memory_cache.clone();
-
-                std::thread::spawn(move || {
-                    let mut req_buf = Vec::new();
-                    let mut buf = [0; 1024];
-                    while let Ok(n) = stream.read(&mut buf) {
-                        if n == 0 { break; }
-                        req_buf.extend_from_slice(&buf[..n]);
-                        if req_buf.windows(4).any(|w| w == b"\r\n\r\n") { break; }
-                    }
-
-                    let req_str = String::from_utf8_lossy(&req_buf);
-                    if req_str.is_empty() || total_size == 0 { return; }
-
-                    let mut start_byte = 0;
-                    let mut end_byte_opt = None;
-                    let mut has_range = false;
-
-                    for line in req_str.lines() {
-                        let line_clean = line.to_lowercase().replace(" ", "");
-                        if line_clean.starts_with("range:bytes=") {
-                            has_range = true;
-                            if let Some(bytes_str) = line_clean.split("bytes=").nth(1) {
-                                let range_str = bytes_str.trim();
-                                if range_str.starts_with('-') {
-                                    if let Ok(suffix_len) = range_str[1..].parse::<u64>() {
-                                        start_byte = total_size.saturating_sub(suffix_len);
-                                        end_byte_opt = Some(total_size.saturating_sub(1));
-                                    }
-                                } else {
-                                    let parts: Vec<&str> = range_str.split('-').collect();
-                                    if let Ok(b) = parts[0].parse::<u64>() { start_byte = b; }
-                                    if parts.len() > 1 && !parts[1].is_empty() {
-                                        if let Ok(b) = parts[1].parse::<u64>() { end_byte_opt = Some(b); }
-                                    }
-                                }
-                            }
-                        }
-                    }
-
-                    if start_byte >= total_size {
-                        let headers = format!("HTTP/1.1 416 Range Not Satisfiable\r\nContent-Range: bytes */{}\r\nConnection: close\r\n\r\n", total_size);
-                        let _ = stream.write_all(headers.as_bytes());
-                        return;
-                    }
-
-                    let end_byte = end_byte_opt.unwrap_or(total_size.saturating_sub(1)).min(total_size.saturating_sub(1));
-                    let content_length = end_byte.saturating_sub(start_byte) + 1;
-
-                    let headers = if has_range {
-                        format!("HTTP/1.1 206 Partial Content\r\nContent-Type: video/mp4\r\nContent-Range: bytes {}-{}/{}\r\nContent-Length: {}\r\nAccept-Ranges: bytes\r\nConnection: close\r\n\r\n", start_byte, end_byte, total_size, content_length)
-                    } else {
-                        format!("HTTP/1.1 200 OK\r\nContent-Type: video/mp4\r\nContent-Length: {}\r\nAccept-Ranges: bytes\r\nConnection: close\r\n\r\n", total_size)
-                    };
-
-                    if stream.write_all(headers.as_bytes()).is_ok() {
-                        if let Some(mem_buf) = &cache {
-                            let start_idx = start_byte as usize;
-                            let end_idx = (start_byte + content_length) as usize;
-                            if start_idx <= mem_buf.len() {
-                                let safe_end = end_idx.min(mem_buf.len());
-                                let _ = stream.write_all(&mem_buf[start_idx..safe_end]);
-                            }
-                        } else if let Some(ds) = physical_data_start {
-                            if let Ok(mut raw_file) = std::fs::File::open(&archive) {
-                                if raw_file.seek(SeekFrom::Start(ds + start_byte)).is_ok() {
-                                    let mut chunk = raw_file.take(content_length);
-                                    let _ = std::io::copy(&mut chunk, &mut stream);
-                                }
-                            }
-                        }
-                    }
-                });
-            } else {
-                std::thread::sleep(Duration::from_millis(10));
-            }
-        }
-    });
-
-    (format!("http://127.0.0.1:{}/vid.mp4", port), stop_signal)
-}
-
 fn show_image<W: Write>(
     stdout: &mut W,
     path: &EntryPath,
@@ -367,12 +230,8 @@ fn show_image<W: Write>(
 ) -> Result<ViewerAction> {
     let img = match path {
         EntryPath::Native(p) => image::open(p)?,
-        EntryPath::InZip(arc, name) => {
-            let file = fs::File::open(arc)?;
-            let mut zip = zip::ZipArchive::new(file)?;
-            let mut zfile = zip.by_name(name)?;
-            let mut buf = Vec::new();
-            zfile.read_to_end(&mut buf)?;
+        _ => {
+            let buf = archive::read_entry(path)?;
             image::load_from_memory(&buf)?
         }
     };
@@ -443,8 +302,8 @@ fn show_video<W: Write>(
 ) -> Result<ViewerAction> {
     let (vid_path_str, stop_server) = match path {
         EntryPath::Native(p) => (p.to_string_lossy().to_string(), None),
-        EntryPath::InZip(arc, name) => {
-            let (url, stop) = stream_zip_video(arc.clone(), name.clone());
+        _ => {
+            let (url, stop) = archive::stream_video(path).unwrap();
             (url, Some(stop))
         }
     };
@@ -759,21 +618,21 @@ fn load_entries(cwd: &EntryPath) -> Vec<BrowserEntry> {
                 for entry in rd.flatten() {
                     let path = entry.path();
                     let name = entry.file_name().to_string_lossy().into_owned();
-                    let is_zip = name.to_lowercase().ends_with(".zip");
-                    let is_dir = path.is_dir() || is_zip;
+                    let arc_ty = archive::archive_type(&name);
+                    let is_dir = path.is_dir() || arc_ty.is_some();
 
                     if is_dir || is_video(&name) || is_image(&name) {
-                        let ep = if is_zip {
-                            EntryPath::InZip(path, String::new())
-                        } else {
-                            EntryPath::Native(path)
+                        let ep = match arc_ty {
+                            Some(ArchiveType::Zip) => EntryPath::InZip(path, String::new()),
+                            Some(ArchiveType::Rar) => EntryPath::InRar(path, String::new()),
+                            None => EntryPath::Native(path),
                         };
                         entries.push(BrowserEntry { path: ep, name, is_dir });
                     }
                 }
             }
         }
-        EntryPath::InZip(archive, prefix) => {
+        EntryPath::InZip(archive, prefix) | EntryPath::InRar(archive, prefix) => {
             if prefix.is_empty() {
                 if let Some(parent) = archive.parent() {
                     entries.push(BrowserEntry {
@@ -790,55 +649,39 @@ fn load_entries(cwd: &EntryPath) -> Vec<BrowserEntry> {
                 } else {
                     format!("{}/", parts.join("/"))
                 };
+                let parent_path = match cwd {
+                    EntryPath::InZip(a, _) => EntryPath::InZip(a.clone(), parent_prefix),
+                    EntryPath::InRar(a, _) => EntryPath::InRar(a.clone(), parent_prefix),
+                    _ => unreachable!(),
+                };
                 entries.push(BrowserEntry {
-                    path: EntryPath::InZip(archive.clone(), parent_prefix),
+                    path: parent_path,
                     name: "..".to_string(),
                     is_dir: true,
                 });
             }
 
-            if let Ok(file) = fs::File::open(archive) {
-                if let Ok(mut zip) = zip::ZipArchive::new(file) {
-                    let mut seen_dirs = HashSet::new();
-                    for i in 0..zip.len() {
-                        if let Ok(zfile) = zip.by_index(i) {
-                            let name = zfile.name();
-                            if !name.starts_with(prefix) || name == prefix {
-                                continue;
-                            }
-
-                            let remainder = &name[prefix.len()..];
-                            if let Some(slash_idx) = remainder.find('/') {
-                                let dir_name = &remainder[..slash_idx];
-                                if !seen_dirs.contains(dir_name) {
-                                    seen_dirs.insert(dir_name.to_string());
-                                    entries.push(BrowserEntry {
-                                        path: EntryPath::InZip(
-                                            archive.clone(),
-                                            format!("{}{}/", prefix, dir_name),
-                                        ),
-                                        name: dir_name.to_string(),
-                                        is_dir: true,
-                                    });
-                                }
-                            } else {
-                                // Exclude nested ZIPs directly.
-                                if name.to_lowercase().ends_with(".zip") {
-                                    continue;
-                                }
-                                if is_video(remainder) || is_image(remainder) {
-                                    entries.push(BrowserEntry {
-                                        path: EntryPath::InZip(
-                                            archive.clone(),
-                                            name.to_string(),
-                                        ),
-                                        name: remainder.to_string(),
-                                        is_dir: false,
-                                    });
-                                }
-                            }
+            if let Ok(a_entries) = archive::list_archive(cwd) {
+                for e in a_entries {
+                    if !e.is_dir {
+                        // Exclude nested archives (zip-in-zip, rar-in-rar, ...)
+                        if archive::archive_type(&e.display_name).is_some() {
+                            continue;
+                        }
+                        if !is_video(&e.display_name) && !is_image(&e.display_name) {
+                            continue;
                         }
                     }
+                    let ep = match cwd {
+                        EntryPath::InZip(a, _) => EntryPath::InZip(a.clone(), e.internal_path),
+                        EntryPath::InRar(a, _) => EntryPath::InRar(a.clone(), e.internal_path),
+                        _ => unreachable!(),
+                    };
+                    entries.push(BrowserEntry {
+                        path: ep,
+                        name: e.display_name,
+                        is_dir: e.is_dir,
+                    });
                 }
             }
         }
@@ -920,6 +763,7 @@ fn show_browser<W: Write>(stdout: &mut W, start_path: EntryPath, max_colors: usi
             let header = match &cwd {
                 EntryPath::Native(p) => format!(" Browser: {} ", p.display()),
                 EntryPath::InZip(arc, prefix) => format!(" Browser: {}/{} ", arc.display(), prefix),
+                EntryPath::InRar(arc, prefix) => format!(" Browser: {}/{} ", arc.display(), prefix),
             };
             
             let _ = write!(
@@ -1095,7 +939,7 @@ fn show_browser<W: Write>(stdout: &mut W, start_path: EntryPath, max_colors: usi
                         if let Some(parent_entry) = entries.iter().find(|e| e.name == "..").cloned() {
                             let prev_dir_name = match &cwd {
                                 EntryPath::Native(p) => p.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default(),
-                                EntryPath::InZip(arc, prefix) => {
+                                EntryPath::InZip(arc, prefix) | EntryPath::InRar(arc, prefix) => {
                                     if prefix.is_empty() {
                                         arc.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default()
                                     } else {
@@ -1137,14 +981,16 @@ fn main() -> Result<()> {
     
     let path = Path::new(&cli.path);
     let abs_path = path.canonicalize().unwrap_or_else(|_| PathBuf::from(&cli.path));
-    
-    let is_zip_ext = abs_path.extension().map_or(false, |e| e.eq_ignore_ascii_case("zip"));
-    
+
+    let start_arc_ty = abs_path
+        .file_name()
+        .and_then(|n| archive::archive_type(&n.to_string_lossy()));
+
     let mut start_path = if abs_path.is_file() {
-        if is_zip_ext {
-            EntryPath::InZip(abs_path.clone(), String::new())
-        } else {
-            EntryPath::Native(abs_path)
+        match start_arc_ty {
+            Some(ArchiveType::Zip) => EntryPath::InZip(abs_path.clone(), String::new()),
+            Some(ArchiveType::Rar) => EntryPath::InRar(abs_path.clone(), String::new()),
+            None => EntryPath::Native(abs_path),
         }
     } else {
         EntryPath::Native(abs_path)
@@ -1156,7 +1002,7 @@ fn main() -> Result<()> {
     let _guard = TermGuard;
 
     if let EntryPath::Native(p) = &mut start_path {
-        if p.is_file() && !is_zip_ext {
+        if p.is_file() && start_arc_ty.is_none() {
             let file_name = p.file_name().unwrap_or_default().to_string_lossy();
             if is_video(&file_name) {
                 let _ = show_video(&mut stdout, &EntryPath::Native(p.clone()), cli.colors);
