@@ -43,6 +43,7 @@ fn load_entries(cwd: &EntryPath) -> Vec<BrowserEntry> {
                         let ep = match arc_ty {
                             Some(ArchiveType::Zip) => EntryPath::InZip(path, String::new()),
                             Some(ArchiveType::Rar) => EntryPath::InRar(path, String::new()),
+                            Some(ArchiveType::SevenZ) => EntryPath::InSevenZ(path, String::new()),
                             None => EntryPath::Native(path),
                         };
                         entries.push(BrowserEntry { path: ep, name, is_dir });
@@ -50,7 +51,9 @@ fn load_entries(cwd: &EntryPath) -> Vec<BrowserEntry> {
                 }
             }
         }
-        EntryPath::InZip(archive, prefix) | EntryPath::InRar(archive, prefix) => {
+        EntryPath::InZip(archive, prefix)
+        | EntryPath::InRar(archive, prefix)
+        | EntryPath::InSevenZ(archive, prefix) => {
             if prefix.is_empty() {
                 if let Some(parent) = archive.parent() {
                     entries.push(BrowserEntry {
@@ -70,6 +73,7 @@ fn load_entries(cwd: &EntryPath) -> Vec<BrowserEntry> {
                 let parent_path = match cwd {
                     EntryPath::InZip(a, _) => EntryPath::InZip(a.clone(), parent_prefix),
                     EntryPath::InRar(a, _) => EntryPath::InRar(a.clone(), parent_prefix),
+                    EntryPath::InSevenZ(a, _) => EntryPath::InSevenZ(a.clone(), parent_prefix),
                     _ => unreachable!(),
                 };
                 entries.push(BrowserEntry {
@@ -93,6 +97,9 @@ fn load_entries(cwd: &EntryPath) -> Vec<BrowserEntry> {
                     let ep = match cwd {
                         EntryPath::InZip(a, _) => EntryPath::InZip(a.clone(), e.internal_path),
                         EntryPath::InRar(a, _) => EntryPath::InRar(a.clone(), e.internal_path),
+                        EntryPath::InSevenZ(a, _) => {
+                            EntryPath::InSevenZ(a.clone(), e.internal_path)
+                        }
                         _ => unreachable!(),
                     };
                     entries.push(BrowserEntry {
@@ -182,6 +189,9 @@ pub fn show_browser<W: Write>(stdout: &mut W, start_path: EntryPath, max_colors:
                 EntryPath::Native(p) => format!(" Browser: {} ", p.display()),
                 EntryPath::InZip(arc, prefix) => format!(" Browser: {}/{} ", arc.display(), prefix),
                 EntryPath::InRar(arc, prefix) => format!(" Browser: {}/{} ", arc.display(), prefix),
+                EntryPath::InSevenZ(arc, prefix) => {
+                    format!(" Browser: {}/{} ", arc.display(), prefix)
+                }
             };
 
             let _ = write!(
@@ -357,7 +367,9 @@ pub fn show_browser<W: Write>(stdout: &mut W, start_path: EntryPath, max_colors:
                         if let Some(parent_entry) = entries.iter().find(|e| e.name == "..").cloned() {
                             let prev_dir_name = match &cwd {
                                 EntryPath::Native(p) => p.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default(),
-                                EntryPath::InZip(arc, prefix) | EntryPath::InRar(arc, prefix) => {
+                                EntryPath::InZip(arc, prefix)
+                                | EntryPath::InRar(arc, prefix)
+                                | EntryPath::InSevenZ(arc, prefix) => {
                                     if prefix.is_empty() {
                                         arc.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default()
                                     } else {

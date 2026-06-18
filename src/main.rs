@@ -57,6 +57,7 @@ fn main() -> Result<()> {
         match start_arc_ty {
             Some(ArchiveType::Zip) => EntryPath::InZip(abs_path.clone(), String::new()),
             Some(ArchiveType::Rar) => EntryPath::InRar(abs_path.clone(), String::new()),
+            Some(ArchiveType::SevenZ) => EntryPath::InSevenZ(abs_path.clone(), String::new()),
             None => EntryPath::Native(abs_path),
         }
     } else {
