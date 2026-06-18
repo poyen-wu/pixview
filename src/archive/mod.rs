@@ -8,9 +8,39 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock, Mutex};
 
 use anyhow::{bail, Result};
+
+/// Process-lifetime cache of passwords keyed by archive path. Populated on
+/// demand when the user enters an encrypted archive; never persisted to disk.
+static PASSWORDS: LazyLock<Mutex<HashMap<PathBuf, String>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Store the password for `path`, replacing any previous value.
+pub fn set_password(path: &Path, password: &str) {
+    PASSWORDS
+        .lock()
+        .expect("PASSWORDS mutex poisoned")
+        .insert(path.to_path_buf(), password.to_string());
+}
+
+/// Returns the cached password for `path`, if any.
+pub fn get_password(path: &Path) -> Option<String> {
+    PASSWORDS
+        .lock()
+        .expect("PASSWORDS mutex poisoned")
+        .get(path)
+        .cloned()
+}
+
+/// Drop the cached password for `path` (e.g. when it proved wrong).
+pub fn clear_password(path: &Path) {
+    PASSWORDS
+        .lock()
+        .expect("PASSWORDS mutex poisoned")
+        .remove(path);
+}
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum EntryPath {
@@ -369,22 +399,66 @@ pub struct ArchiveEntry {
     pub is_dir: bool,
 }
 
+/// True iff the archive's filenames/headers are encrypted, i.e. listing is
+/// impossible without a password. Always `false` for non-archives and for
+/// formats that never encrypt filenames (ZIP).
+pub fn requires_password_for_listing(path: &Path) -> Result<bool> {
+    match archive_type_ext(path) {
+        Some(ArchiveType::Zip) => zip::zip_needs_password_to_list(path),
+        Some(ArchiveType::Rar) => rar::rar_needs_password_to_list(path),
+        Some(ArchiveType::SevenZ) => sevenz::sevenz_needs_password_to_list(path),
+        None => Ok(false),
+    }
+}
+
+/// True iff the archive's *content* is encrypted while filenames remain
+/// readable (so listing works but reading entries needs a password). Always
+/// `false` for non-archives.
+pub fn requires_password_for_content(path: &Path) -> Result<bool> {
+    match archive_type_ext(path) {
+        Some(ArchiveType::Zip) => zip::zip_content_encrypted(path),
+        Some(ArchiveType::Rar) => rar::rar_content_encrypted(path),
+        Some(ArchiveType::SevenZ) => sevenz::sevenz_content_encrypted(path),
+        None => Ok(false),
+    }
+}
+
+/// Validate the currently-cached password for `archive` by decrypting a small
+/// probe entry. Used by the UI's wrong-password retry loop. Returns `Ok(())`
+/// if the password decrypts, `Err` otherwise.
+pub fn validate_password_by_probe(archive: &Path) -> Result<()> {
+    let pwd = match get_password(archive) {
+        Some(p) => p,
+        None => bail!("no password cached to validate"),
+    };
+    match archive_type_ext(archive) {
+        Some(ArchiveType::Zip) => zip::zip_validate_password(archive, &pwd),
+        Some(ArchiveType::Rar) => rar::rar_validate_password(archive, &pwd),
+        Some(ArchiveType::SevenZ) => sevenz::sevenz_validate_password(archive, &pwd),
+        None => bail!("not an archive: {}", archive.display()),
+    }
+}
+
 /// Read the full bytes of a single archive entry. Used for loading images.
 pub fn read_entry(path: &EntryPath) -> Result<Vec<u8>> {
     match path {
         EntryPath::Native(_) => bail!("read_entry is only valid for archive paths"),
-        EntryPath::InZip(arc, name) => zip::read_zip_entry(arc, name),
-        EntryPath::InRar(arc, name) => rar::read_rar_entry(arc, name),
-        EntryPath::InSevenZ(arc, name) => sevenz::read_7z_entry(arc, name),
+        EntryPath::InZip(arc, name) => zip::read_zip_entry(arc, name, get_password(arc).as_deref()),
+        EntryPath::InRar(arc, name) => rar::read_rar_entry(arc, name, get_password(arc).as_deref()),
+        EntryPath::InSevenZ(arc, name) => {
+            sevenz::read_7z_entry(arc, name, get_password(arc).as_deref())
+        }
     }
 }
 
 /// List entries under the prefix of an `InZip` / `InRar` / `InSevenZ` cwd.
 pub fn list_archive(cwd: &EntryPath) -> Result<Vec<ArchiveEntry>> {
     match cwd {
-        EntryPath::InZip(arc, prefix) => zip::list_zip(arc, prefix),
-        EntryPath::InRar(arc, prefix) => rar::list_rar(arc, prefix),
-        EntryPath::InSevenZ(arc, prefix) => sevenz::list_7z(arc, prefix),
+        EntryPath::InZip(arc, prefix) => zip::list_zip(arc, prefix, get_password(arc).as_deref()),
+        EntryPath::InRar(arc, prefix) => rar::list_rar(arc, prefix, get_password(arc).as_deref()),
+        EntryPath::InSevenZ(arc, prefix) => {
+            sevenz::list_7z(arc, prefix, get_password(arc).as_deref())
+        }
         EntryPath::Native(_) => bail!("list_archive is only valid for archive paths"),
     }
 }
@@ -394,9 +468,17 @@ pub fn list_archive(cwd: &EntryPath) -> Result<Vec<ArchiveEntry>> {
 pub fn stream_video(path: &EntryPath) -> Option<(String, Arc<AtomicBool>)> {
     match path {
         EntryPath::Native(_) => None,
-        EntryPath::InZip(arc, name) => Some(zip::stream_zip_video(arc.clone(), name.clone())),
-        EntryPath::InRar(arc, name) => Some(rar::stream_rar_video(arc.clone(), name.clone())),
-        EntryPath::InSevenZ(arc, name) => Some(sevenz::stream_7z_video(arc.clone(), name.clone())),
+        EntryPath::InZip(arc, name) => {
+            Some(zip::stream_zip_video(arc.clone(), name.clone(), get_password(arc)))
+        }
+        EntryPath::InRar(arc, name) => {
+            Some(rar::stream_rar_video(arc.clone(), name.clone(), get_password(arc)))
+        }
+        EntryPath::InSevenZ(arc, name) => Some(sevenz::stream_7z_video(
+            arc.clone(),
+            name.clone(),
+            get_password(arc),
+        )),
     }
 }
 

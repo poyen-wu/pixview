@@ -1,4 +1,5 @@
 use std::io::Write;
+use std::path::Path;
 use std::time::Duration;
 
 use anyhow::Result;
@@ -240,6 +241,234 @@ fn settle_selectable(entries: &[BrowserEntry], from: usize) -> usize {
     from
 }
 
+/// Outcome of a single password popup interaction.
+enum PromptInput {
+    Submitted(String),
+    Cancelled,
+    Quit,
+}
+
+/// Outcome of the password-ensure orchestration.
+enum PromptOutcome {
+    /// Password resolved (or not needed); proceed with the action.
+    Proceed,
+    /// User cancelled (Esc); abort the current navigation/open.
+    Cancelled,
+    /// User requested to quit the program (Ctrl+C).
+    Quit,
+}
+
+/// Returns the on-disk archive path for an in-archive `EntryPath`, or `None`
+/// for native filesystem paths (which never need a password).
+fn archive_path_of(path: &EntryPath) -> Option<&Path> {
+    match path {
+        EntryPath::InZip(arc, _) | EntryPath::InRar(arc, _) | EntryPath::InSevenZ(arc, _) => {
+            Some(arc.as_path())
+        }
+        EntryPath::Native(_) => None,
+    }
+}
+
+/// Build the root-prefixed `EntryPath` (matching `target`'s variant) for an
+/// archive, used when validating a password by attempting a listing.
+fn archive_root(target: &EntryPath, arc: &Path) -> EntryPath {
+    match target {
+        EntryPath::InZip(_, _) => EntryPath::InZip(arc.to_path_buf(), String::new()),
+        EntryPath::InRar(_, _) => EntryPath::InRar(arc.to_path_buf(), String::new()),
+        EntryPath::InSevenZ(_, _) => EntryPath::InSevenZ(arc.to_path_buf(), String::new()),
+        EntryPath::Native(_) => EntryPath::Native(arc.to_path_buf()),
+    }
+}
+
+fn char_width(s: &str) -> usize {
+    s.chars().count()
+}
+
+fn pad_to(s: &str, w: usize) -> String {
+    let cw = char_width(s);
+    if cw >= w {
+        s.to_string()
+    } else {
+        format!("{}{}", s, " ".repeat(w - cw))
+    }
+}
+
+fn truncate_str(s: &str, max: usize) -> String {
+    let chars: Vec<char> = s.chars().collect();
+    if chars.len() <= max {
+        return s.to_string();
+    }
+    let head = max.saturating_sub(1);
+    let mut out: String = chars[..head].iter().collect();
+    out.push('\u{2026}');
+    out
+}
+
+fn repeat_char(c: char, n: usize) -> String {
+    c.to_string().repeat(n)
+}
+
+/// Render the centered, reverse-video password modal. `masked` is the
+/// asterisk string reflecting the currently typed length.
+fn render_password_box<W: Write>(
+    stdout: &mut W,
+    name: &str,
+    masked: &str,
+    error: Option<&str>,
+) -> Result<()> {
+    let (cols, rows) = terminal::size()?;
+    let cols = cols as usize;
+    let rows = rows as usize;
+
+    let mut lines: Vec<String> = Vec::new();
+    lines.push(" Password required ".to_string());
+    lines.push(format!(" {} ", truncate_str(name, 64)));
+    lines.push(format!(" Password: {} ", masked));
+    if let Some(e) = error {
+        lines.push(format!(" {} ", truncate_str(e, 72)));
+    }
+    lines.push(" Enter confirm \u{00b7} Esc cancel \u{00b7} Ctrl+C quit ".to_string());
+
+    let inner_w = lines
+        .iter()
+        .map(|l| l.chars().count())
+        .max()
+        .unwrap_or(20)
+        .max(36);
+    let box_w = (inner_w + 2).min(cols.max(2));
+    let inner_w = box_w.saturating_sub(2);
+    let padded: Vec<String> = lines.iter().map(|l| pad_to(l, inner_w)).collect();
+    let box_h = padded.len() + 2;
+    let start_row = rows.saturating_sub(box_h) / 2;
+    let start_col = cols.saturating_sub(box_w) / 2;
+
+    let mut buf: Vec<u8> = Vec::with_capacity(1024);
+    let border = repeat_char('\u{2500}', inner_w);
+    let _ = write!(
+        buf,
+        "\x1b[{};{}H\x1b[7m\u{250c}{}\u{2510}\x1b[0m",
+        start_row + 1,
+        start_col + 1,
+        border
+    );
+    for (i, l) in padded.iter().enumerate() {
+        let _ = write!(
+            buf,
+            "\x1b[{};{}H\x1b[7m\u{2502}{}\u{2502}\x1b[0m",
+            start_row + 2 + i,
+            start_col + 1,
+            l
+        );
+    }
+    let bottom_row = start_row + 1 + padded.len();
+    let _ = write!(
+        buf,
+        "\x1b[{};{}H\x1b[7m\u{2514}{}\u{2518}\x1b[0m",
+        bottom_row + 1,
+        start_col + 1,
+        border
+    );
+    stdout.write_all(&buf)?;
+    stdout.flush()?;
+    Ok(())
+}
+
+/// Show the password popup and read a single submission. Returns
+/// [`PromptInput::Submitted`] on Enter, [`PromptInput::Cancelled`] on Esc,
+/// [`PromptInput::Quit`] on Ctrl+C. The password is masked with `*`.
+fn prompt_password<W: Write>(
+    stdout: &mut W,
+    archive_path: &Path,
+    error: Option<&str>,
+) -> Result<PromptInput> {
+    let mut input = String::new();
+    let name = archive_path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| archive_path.display().to_string());
+
+    let masked_of = |i: &str| "*".repeat(i.chars().count());
+    render_password_box(stdout, &name, &masked_of(&input), error)?;
+
+    loop {
+        if event::poll(Duration::from_millis(1000))? {
+            if let Event::Key(key) = event::read()? {
+                match key.code {
+                    KeyCode::Enter => return Ok(PromptInput::Submitted(input)),
+                    KeyCode::Esc => return Ok(PromptInput::Cancelled),
+                    KeyCode::Backspace => {
+                        input.pop();
+                        render_password_box(stdout, &name, &masked_of(&input), error)?;
+                    }
+                    KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        return Ok(PromptInput::Quit);
+                    }
+                    KeyCode::Char(c) if !c.is_control() => {
+                        if input.chars().count() < 1024 {
+                            input.push(c);
+                            render_password_box(stdout, &name, &masked_of(&input), error)?;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+}
+
+/// Ensure a password is cached for the archive referenced by `target`, if one
+/// is needed.
+///
+/// When `listing_only` is true, a password is prompted for only if the
+/// archive's filenames/headers are encrypted (listing is impossible without
+/// it). Otherwise (opening a media file) a password is also prompted for when
+/// the archive's *content* is encrypted. Validation re-prompts inline on a
+/// wrong password. Returns `Proceed` once the password is resolved (or not
+/// needed), `Cancelled` on Esc, `Quit` on Ctrl+C.
+fn ensure_password<W: Write>(
+    stdout: &mut W,
+    target: &EntryPath,
+    listing_only: bool,
+) -> Result<PromptOutcome> {
+    let Some(arc) = archive_path_of(target) else {
+        return Ok(PromptOutcome::Proceed);
+    };
+    if archive::get_password(arc).is_some() {
+        return Ok(PromptOutcome::Proceed);
+    }
+
+    let needs_listing = archive::requires_password_for_listing(arc).unwrap_or(false);
+    let needs_content = if listing_only || needs_listing {
+        false
+    } else {
+        archive::requires_password_for_content(arc).unwrap_or(false)
+    };
+    if !needs_listing && !needs_content {
+        return Ok(PromptOutcome::Proceed);
+    }
+
+    let mut error: Option<String> = None;
+    loop {
+        match prompt_password(stdout, arc, error.as_deref())? {
+            PromptInput::Cancelled => return Ok(PromptOutcome::Cancelled),
+            PromptInput::Quit => return Ok(PromptOutcome::Quit),
+            PromptInput::Submitted(pwd) => {
+                archive::set_password(arc, &pwd);
+                let ok = if needs_listing {
+                    archive::list_archive(&archive_root(target, arc)).is_ok()
+                } else {
+                    archive::validate_password_by_probe(arc).is_ok()
+                };
+                if ok {
+                    return Ok(PromptOutcome::Proceed);
+                }
+                archive::clear_password(arc);
+                error = Some("Wrong password, or archive unreadable. Try again.".to_string());
+            }
+        }
+    }
+}
+
 pub fn show_browser<W: Write>(stdout: &mut W, start_path: EntryPath, max_colors: usize) -> Result<()> {
     let mut cwd = start_path;
     let mut selected = 0;
@@ -386,19 +615,38 @@ pub fn show_browser<W: Write>(stdout: &mut W, start_path: EntryPath, max_colors:
                         if !entries.is_empty() {
                             let entry = &entries[selected];
                             if entry.is_dir {
-                                if entry.name == ".." {
-                                    cwd = entry.path.clone();
-                                } else {
-                                    cwd = resolve_single_dir(entry.path.clone());
+                                let target_path = entry.path.clone();
+                                match ensure_password(stdout, &target_path, true)? {
+                                    PromptOutcome::Quit => return Ok(()),
+                                    PromptOutcome::Cancelled => {
+                                        needs_redraw = true;
+                                    }
+                                    PromptOutcome::Proceed => {
+                                        if entry.name == ".." {
+                                            cwd = target_path;
+                                        } else {
+                                            cwd = resolve_single_dir(target_path);
+                                        }
+                                        selected = 0;
+                                        scroll = 0;
+                                        needs_refresh = true;
+                                        needs_redraw = true;
+                                    }
                                 }
-                                selected = 0;
-                                scroll = 0;
-                                needs_refresh = true;
-                                needs_redraw = true;
                             } else {
                                 let mut current_idx = selected;
                                 loop {
                                     let view_entry = &entries[current_idx];
+                                    match ensure_password(stdout, &view_entry.path, false)? {
+                                        PromptOutcome::Quit => return Ok(()),
+                                        PromptOutcome::Cancelled => {
+                                            selected = current_idx;
+                                            needs_refresh = true;
+                                            needs_redraw = true;
+                                            break;
+                                        }
+                                        PromptOutcome::Proceed => {}
+                                    }
                                     let action_res = if is_video(&view_entry.name) {
                                         show_video(stdout, &view_entry.path, max_colors)
                                     } else if is_image(&view_entry.name) {

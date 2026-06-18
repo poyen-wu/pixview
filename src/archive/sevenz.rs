@@ -8,25 +8,52 @@ use super::http_server::{spawn_http_stream, StreamSource};
 use super::multi::MultiFileReader;
 use super::{split_set, ArchiveEntry};
 
-pub(crate) fn read_7z_entry(archive: &Path, name: &str) -> Result<Vec<u8>> {
-    if let Some(parts) = split_set(archive) {
-        let mut reader = MultiFileReader::open(&parts)?;
-        let mut ar = sevenz_rust2::ArchiveReader::new(&mut reader, sevenz_rust2::Password::empty())?;
-        let data = ar.read_file(name)?;
-        return Ok(data);
+/// Maximum entry size we're willing to fully decode just to validate a
+/// candidate password. Entries larger than this are skipped when picking a
+/// probe target.
+const PROBE_SIZE_CAP: u64 = 32 * 1024 * 1024;
+
+fn make_password(p: Option<&str>) -> sevenz_rust2::Password {
+    match p {
+        Some(s) => sevenz_rust2::Password::new(s),
+        None => sevenz_rust2::Password::empty(),
     }
-    let mut reader = sevenz_rust2::ArchiveReader::open(archive, sevenz_rust2::Password::empty())?;
-    let data = reader.read_file(name)?;
-    Ok(data)
 }
 
-pub(crate) fn list_7z(archive: &Path, prefix: &str) -> Result<Vec<ArchiveEntry>> {
-    let archive_info = if let Some(parts) = split_set(archive) {
+/// Open a parsed `Archive` (headers only) using an empty password. Works for
+/// non-encrypted and content-encrypted archives; fails with `PasswordRequired`
+/// when filenames themselves are encrypted.
+fn open_7z_info(archive: &Path) -> Result<sevenz_rust2::Archive> {
+    if let Some(parts) = split_set(archive) {
         let mut reader = MultiFileReader::open(&parts)?;
-        sevenz_rust2::Archive::read(&mut reader, &sevenz_rust2::Password::empty())?
+        Ok(sevenz_rust2::Archive::read(
+            &mut reader,
+            &sevenz_rust2::Password::empty(),
+        )?)
     } else {
-        sevenz_rust2::Archive::open(archive)?
-    };
+        Ok(sevenz_rust2::Archive::open(archive)?)
+    }
+}
+
+pub(crate) fn read_7z_entry(archive: &Path, name: &str, password: Option<&str>) -> Result<Vec<u8>> {
+    let pwd = make_password(password);
+    if let Some(parts) = split_set(archive) {
+        let mut reader = MultiFileReader::open(&parts)?;
+        let mut ar = sevenz_rust2::ArchiveReader::new(&mut reader, pwd)?;
+        return Ok(ar.read_file(name)?);
+    }
+    let mut reader = sevenz_rust2::ArchiveReader::open(archive, pwd)?;
+    Ok(reader.read_file(name)?)
+}
+
+pub(crate) fn list_7z(
+    archive: &Path,
+    prefix: &str,
+    _password: Option<&str>,
+) -> Result<Vec<ArchiveEntry>> {
+    // Listing parses headers with an empty password; for content-encrypted
+    // archives filenames remain readable, so no password is needed here.
+    let archive_info = open_7z_info(archive)?;
 
     let mut out = Vec::new();
     let mut seen_dirs = HashSet::new();
@@ -35,7 +62,7 @@ pub(crate) fn list_7z(archive: &Path, prefix: &str) -> Result<Vec<ArchiveEntry>>
         if entry.is_directory() {
             continue;
         }
-        let name = entry.name().replace('\\', "/");
+        let name = entry.name.replace('\\', "/");
         if !name.starts_with(prefix) || name == prefix {
             continue;
         }
@@ -61,9 +88,70 @@ pub(crate) fn list_7z(archive: &Path, prefix: &str) -> Result<Vec<ArchiveEntry>>
     Ok(out)
 }
 
+/// True iff the 7z encrypts its header (filenames), i.e. listing is impossible
+/// without a password.
+pub(crate) fn sevenz_needs_password_to_list(archive: &Path) -> Result<bool> {
+    let err = if let Some(parts) = split_set(archive) {
+        let mut reader = MultiFileReader::open(&parts)?;
+        sevenz_rust2::Archive::read(&mut reader, &sevenz_rust2::Password::empty())
+    } else {
+        let mut reader = std::fs::File::open(archive)?;
+        sevenz_rust2::Archive::read(&mut reader, &sevenz_rust2::Password::empty())
+    };
+    Ok(matches!(err, Err(sevenz_rust2::Error::PasswordRequired)))
+}
+
+/// True iff the archive's content is encrypted while filenames remain
+/// readable. Detected by scanning the compression blocks for an AES coder.
+pub(crate) fn sevenz_content_encrypted(archive: &Path) -> Result<bool> {
+    let archive_info = open_7z_info(archive)?;
+    for block in &archive_info.blocks {
+        for coder in &block.coders {
+            if coder.encoder_method_id() == sevenz_rust2::EncoderMethod::ID_AES256_SHA256 {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
+}
+
+/// Validate `password` by reading the smallest file entry with it.
+pub(crate) fn sevenz_validate_password(archive: &Path, password: &str) -> Result<()> {
+    let archive_info = open_7z_info(archive)?;
+    let mut best: Option<&str> = None;
+    let mut best_size = u64::MAX;
+    for e in &archive_info.files {
+        if e.is_directory() || !e.has_stream {
+            continue;
+        }
+        if e.size > PROBE_SIZE_CAP || e.size >= best_size {
+            continue;
+        }
+        best_size = e.size;
+        best = Some(e.name.as_str());
+    }
+
+    let Some(name) = best else {
+        // No small entry to probe; trust the password.
+        return Ok(());
+    };
+
+    let pwd = sevenz_rust2::Password::new(password);
+    if let Some(parts) = split_set(archive) {
+        let mut reader = MultiFileReader::open(&parts)?;
+        let mut ar = sevenz_rust2::ArchiveReader::new(&mut reader, pwd)?;
+        ar.read_file(name)?;
+    } else {
+        let mut ar = sevenz_rust2::ArchiveReader::open(archive, pwd)?;
+        ar.read_file(name)?;
+    }
+    Ok(())
+}
+
 pub(crate) fn stream_7z_video(
     archive: PathBuf,
     name: String,
+    password: Option<String>,
 ) -> (String, Arc<std::sync::atomic::AtomicBool>) {
     // 7z commonly uses solid compression (multiple files sharing one compressed
     // stream), so there is no reliable random-access API. Like the RAR/compressed-zip
@@ -71,19 +159,17 @@ pub(crate) fn stream_7z_video(
     // transparently because MultiFileReader exposes the concatenated stream.
     let mut in_memory_cache: Option<Arc<Vec<u8>>> = None;
 
+    let pwd = make_password(password.as_deref());
     let read_ok = if let Some(parts) = split_set(&archive) {
         MultiFileReader::open(&parts)
             .and_then(|mut reader| {
-                let mut ar = sevenz_rust2::ArchiveReader::new(
-                    &mut reader,
-                    sevenz_rust2::Password::empty(),
-                )?;
+                let mut ar = sevenz_rust2::ArchiveReader::new(&mut reader, pwd)?;
                 ar.read_file(&name).map(Some).map_err(Into::into)
             })
             .ok()
             .flatten()
     } else {
-        sevenz_rust2::ArchiveReader::open(&archive, sevenz_rust2::Password::empty())
+        sevenz_rust2::ArchiveReader::open(&archive, pwd)
             .ok()
             .and_then(|mut reader| reader.read_file(&name).ok())
     };
