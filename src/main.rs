@@ -1,4 +1,3 @@
-mod archive;
 mod browser;
 mod ffmpeg;
 mod sixel;
@@ -19,6 +18,8 @@ use archive::{ArchiveType, EntryPath};
 use browser::{resolve_single_dir, show_browser};
 use util::is_video;
 use viewer::{show_image, show_video};
+
+use pixview::archive;
 
 #[derive(Parser)]
 #[command(name = "pixview", about = "Display images and video thumbnails using sixel")]
@@ -49,9 +50,13 @@ fn main() -> Result<()> {
     let path = Path::new(&cli.path);
     let abs_path = path.canonicalize().unwrap_or_else(|_| PathBuf::from(&cli.path));
 
-    let start_arc_ty = abs_path
-        .file_name()
-        .and_then(|n| archive::archive_type(&n.to_string_lossy()));
+    let start_arc_ty = if abs_path.is_file() {
+        archive::archive_type_ext(&abs_path)
+    } else {
+        abs_path
+            .file_name()
+            .and_then(|n| archive::archive_type(&n.to_string_lossy()))
+    };
 
     let mut start_path = if abs_path.is_file() {
         match start_arc_ty {

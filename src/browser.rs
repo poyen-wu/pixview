@@ -1,4 +1,3 @@
-use std::fs;
 use std::io::Write;
 use std::time::Duration;
 
@@ -8,7 +7,7 @@ use crossterm::{
     terminal,
 };
 
-use crate::archive::{self, ArchiveType, EntryPath};
+use crate::archive::{self, ArchiveType, EntryClassification, EntryPath};
 use crate::util::{is_image, is_video};
 use crate::viewer::{show_image, show_video, ViewerAction};
 
@@ -17,6 +16,9 @@ struct BrowserEntry {
     path: EntryPath,
     name: String,
     is_dir: bool,
+    /// False for non-primary parts of a split archive (e.g. `.002`, `.part02.rar`).
+    /// Rendered dimmed and skipped by cursor navigation.
+    selectable: bool,
 }
 
 fn load_entries(cwd: &EntryPath) -> Vec<BrowserEntry> {
@@ -29,26 +31,54 @@ fn load_entries(cwd: &EntryPath) -> Vec<BrowserEntry> {
                     path: EntryPath::Native(parent.to_path_buf()),
                     name: "..".to_string(),
                     is_dir: true,
+                    selectable: true,
                 });
             }
 
-            if let Ok(rd) = fs::read_dir(dir) {
-                for entry in rd.flatten() {
-                    let path = entry.path();
-                    let name = entry.file_name().to_string_lossy().into_owned();
-                    let arc_ty = archive::archive_type(&name);
-                    let is_dir = path.is_dir() || arc_ty.is_some();
+            // Classify the whole directory in one pass so split-set grouping
+            // (which needs to inspect siblings) only scans once.
+            let classifications = archive::classify_directory(dir).unwrap_or_default();
 
-                    if is_dir || is_video(&name) || is_image(&name) {
-                        let ep = match arc_ty {
-                            Some(ArchiveType::Zip) => EntryPath::InZip(path, String::new()),
-                            Some(ArchiveType::Rar) => EntryPath::InRar(path, String::new()),
-                            Some(ArchiveType::SevenZ) => EntryPath::InSevenZ(path, String::new()),
-                            None => EntryPath::Native(path),
-                        };
-                        entries.push(BrowserEntry { path: ep, name, is_dir });
-                    }
+            for (path, class) in classifications {
+                let name = path
+                    .file_name()
+                    .map(|s| s.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+
+                let arc_ty = class.archive_type();
+                let is_split_nonprimary = matches!(
+                    &class,
+                    EntryClassification::SplitMember { is_primary: false, .. }
+                );
+                // Non-primary parts aren't navigable on their own; sort with files.
+                let is_dir = !is_split_nonprimary && (path.is_dir() || arc_ty.is_some());
+
+                // Keep split non-primary parts visible (greyed) even though they
+                // have no media extension; the cursor skips over them.
+                if !(is_dir || is_split_nonprimary || is_video(&name) || is_image(&name)) {
+                    continue;
                 }
+
+                let selectable = !is_split_nonprimary;
+
+                // Non-selectable parts are never navigated (cursor can't land
+                // on them), so the EntryPath variant is moot — use Native.
+                let ep = if is_split_nonprimary {
+                    EntryPath::Native(path)
+                } else {
+                    match arc_ty {
+                        Some(ArchiveType::Zip) => EntryPath::InZip(path, String::new()),
+                        Some(ArchiveType::Rar) => EntryPath::InRar(path, String::new()),
+                        Some(ArchiveType::SevenZ) => EntryPath::InSevenZ(path, String::new()),
+                        None => EntryPath::Native(path),
+                    }
+                };
+                entries.push(BrowserEntry {
+                    path: ep,
+                    name,
+                    is_dir,
+                    selectable,
+                });
             }
         }
         EntryPath::InZip(archive, prefix)
@@ -60,6 +90,7 @@ fn load_entries(cwd: &EntryPath) -> Vec<BrowserEntry> {
                         path: EntryPath::Native(parent.to_path_buf()),
                         name: "..".to_string(),
                         is_dir: true,
+                        selectable: true,
                     });
                 }
             } else {
@@ -80,6 +111,7 @@ fn load_entries(cwd: &EntryPath) -> Vec<BrowserEntry> {
                     path: parent_path,
                     name: "..".to_string(),
                     is_dir: true,
+                    selectable: true,
                 });
             }
 
@@ -106,6 +138,7 @@ fn load_entries(cwd: &EntryPath) -> Vec<BrowserEntry> {
                         path: ep,
                         name: e.display_name,
                         is_dir: e.is_dir,
+                        selectable: true,
                     });
                 }
             }
@@ -152,6 +185,61 @@ pub(crate) fn resolve_single_dir(mut target: EntryPath) -> EntryPath {
     target
 }
 
+/// Walk forward or backward one entry at a time, skipping non-selectable rows.
+/// Returns the resulting index (clamped to bounds). If the destination is
+/// non-selectable, keeps walking in the same direction until a selectable row
+/// is found or a boundary is hit (in which case the current index is kept).
+fn step_selectable(entries: &[BrowserEntry], from: usize, forward: bool) -> usize {
+    if entries.is_empty() {
+        return 0;
+    }
+    let mut cur = from.min(entries.len() - 1);
+    loop {
+        let next = if forward {
+            cur.checked_add(1).filter(|&n| n < entries.len())
+        } else {
+            cur.checked_sub(1)
+        };
+        match next {
+            Some(n) => {
+                cur = n;
+                if entries[cur].selectable {
+                    return cur;
+                }
+            }
+            None => return cur,
+        }
+    }
+}
+
+/// Snap to the nearest selectable entry from `from` (searching both forward
+/// and backward). Used after Home/End/Page jumps that may land on a
+/// non-selectable row.
+fn settle_selectable(entries: &[BrowserEntry], from: usize) -> usize {
+    if entries.is_empty() {
+        return 0;
+    }
+    let from = from.min(entries.len() - 1);
+    if entries[from].selectable {
+        return from;
+    }
+    for offset in 1..=entries.len() {
+        let fwd = from.checked_add(offset).filter(|&n| n < entries.len());
+        let bwd = from.checked_sub(offset);
+        if let Some(f) = fwd {
+            if entries[f].selectable {
+                return f;
+            }
+        }
+        if let Some(b) = bwd {
+            if entries[b].selectable {
+                return b;
+            }
+        }
+    }
+    from
+}
+
 pub fn show_browser<W: Write>(stdout: &mut W, start_path: EntryPath, max_colors: usize) -> Result<()> {
     let mut cwd = start_path;
     let mut selected = 0;
@@ -166,6 +254,9 @@ pub fn show_browser<W: Write>(stdout: &mut W, start_path: EntryPath, max_colors:
             if selected >= entries.len() {
                 selected = entries.len().saturating_sub(1);
             }
+            // Snap off any non-selectable landing (e.g. after entering a dir
+            // whose first row happens to be a non-primary split part).
+            selected = settle_selectable(&entries, selected);
             needs_refresh = false;
             needs_redraw = true;
         }
@@ -205,7 +296,9 @@ pub fn show_browser<W: Write>(stdout: &mut W, start_path: EntryPath, max_colors:
                 let idx = scroll + i;
                 if idx < entries.len() {
                     let entry = &entries[idx];
-                    let type_tag = if entry.is_dir {
+                    let type_tag = if !entry.selectable {
+                        "PT "
+                    } else if entry.is_dir {
                         "DIR"
                     } else if is_video(&entry.name) {
                         "VID"
@@ -213,10 +306,28 @@ pub fn show_browser<W: Write>(stdout: &mut W, start_path: EntryPath, max_colors:
                         "IMG"
                     };
 
-                    if idx == selected {
-                        let _ = write!(&mut buf, "\x1b[7m> [{}] {} \x1b[0m\x1b[K\r\n", type_tag, entry.name);
+                    if !entry.selectable {
+                        // Dim non-selectable (non-primary split parts).
+                        let _ = write!(
+                            &mut buf,
+                            "\x1b[2m  [{}] {} \x1b[0m\x1b[K\r\n",
+                            type_tag,
+                            entry.name
+                        );
+                    } else if idx == selected {
+                        let _ = write!(
+                            &mut buf,
+                            "\x1b[7m> [{}] {} \x1b[0m\x1b[K\r\n",
+                            type_tag,
+                            entry.name
+                        );
                     } else {
-                        let _ = write!(&mut buf, "  [{}] {} \x1b[K\r\n", type_tag, entry.name);
+                        let _ = write!(
+                            &mut buf,
+                            "  [{}] {} \x1b[K\r\n",
+                            type_tag,
+                            entry.name
+                        );
                     }
                 } else {
                     let _ = write!(&mut buf, "\x1b[K\r\n");
@@ -244,31 +355,31 @@ pub fn show_browser<W: Write>(stdout: &mut W, start_path: EntryPath, max_colors:
                 Event::Key(key) => match key.code {
                     KeyCode::Char('q') => return Ok(()),
                     KeyCode::Up | KeyCode::Char('k') => {
-                        selected = selected.saturating_sub(1);
+                        selected = step_selectable(&entries, selected, false);
                         needs_redraw = true;
                     }
                     KeyCode::Down | KeyCode::Char('j') => {
-                        if selected + 1 < entries.len() {
-                            selected += 1;
-                            needs_redraw = true;
-                        }
+                        selected = step_selectable(&entries, selected, true);
+                        needs_redraw = true;
                     }
                     KeyCode::Home => {
-                        selected = 0;
+                        selected = settle_selectable(&entries, 0);
                         needs_redraw = true;
                     }
                     KeyCode::End | KeyCode::Char(' ') => {
                         if !entries.is_empty() {
-                            selected = entries.len().saturating_sub(1);
+                            selected = settle_selectable(&entries, entries.len() - 1);
                             needs_redraw = true;
                         }
                     }
                     KeyCode::PageUp | KeyCode::Backspace => {
-                        selected = selected.saturating_sub(list_rows);
+                        let target = selected.saturating_sub(list_rows);
+                        selected = settle_selectable(&entries, target);
                         needs_redraw = true;
                     }
                     KeyCode::PageDown | KeyCode::Tab => {
-                        selected = (selected + list_rows).min(entries.len().saturating_sub(1));
+                        let target = (selected + list_rows).min(entries.len().saturating_sub(1));
+                        selected = settle_selectable(&entries, target);
                         needs_redraw = true;
                     }
                     KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => {
@@ -329,7 +440,7 @@ pub fn show_browser<W: Write>(stdout: &mut W, start_path: EntryPath, max_colors:
                                         ViewerAction::NextFile => {
                                             let mut next_idx = current_idx;
                                             for i in (current_idx + 1)..entries.len() {
-                                                if !entries[i].is_dir {
+                                                if !entries[i].is_dir && entries[i].selectable {
                                                     next_idx = i;
                                                     break;
                                                 }
@@ -345,7 +456,7 @@ pub fn show_browser<W: Write>(stdout: &mut W, start_path: EntryPath, max_colors:
                                         ViewerAction::PreviousFile => {
                                             let mut prev_idx = current_idx;
                                             for i in (0..current_idx).rev() {
-                                                if !entries[i].is_dir {
+                                                if !entries[i].is_dir && entries[i].selectable {
                                                     prev_idx = i;
                                                     break;
                                                 }

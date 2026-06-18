@@ -4,16 +4,25 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+use super::multi::FileSegment;
+
 /// Source of bytes for a streaming response. Each backend produces one of these
-/// up front; `spawn_http_stream` then handles the HTTP serving for both cases.
+/// up front; `spawn_http_stream` then handles the HTTP serving for all cases.
 pub(crate) enum StreamSource {
     /// Entry fully buffered in RAM (compressed RAR/7z entries, or compressed ZIP entries).
     Memory(Arc<Vec<u8>>),
-    /// Entry can be served by seeking into the archive file on disk (stored ZIP entries),
-    /// starting at byte `data_start` and running for `total` bytes.
+    /// Entry can be served by seeking into a single archive file on disk
+    /// (stored ZIP entries), starting at byte `data_start` and running for `total` bytes.
     FileRange {
         path: std::path::PathBuf,
         data_start: u64,
+        total: u64,
+    },
+    /// Entry spans multiple physical files (split ZIP / split 7z stored entries).
+    /// `segments` is an ordered list of contiguous byte ranges, one per part file
+    /// the entry touches; `total` is the sum of all `len_in_file` values.
+    MultiFileRange {
+        segments: Vec<FileSegment>,
         total: u64,
     },
 }
@@ -23,6 +32,7 @@ impl StreamSource {
         match self {
             StreamSource::Memory(buf) => buf.len() as u64,
             StreamSource::FileRange { total, .. } => *total,
+            StreamSource::MultiFileRange { total, .. } => *total,
         }
     }
 }
@@ -143,6 +153,9 @@ pub(crate) fn spawn_http_stream(source: StreamSource) -> (String, Arc<AtomicBool
                                     }
                                 }
                             }
+                            StreamSource::MultiFileRange { segments, .. } => {
+                                stream_multi_range(segments, &mut stream, start_byte, content_length);
+                            }
                         }
                     }
                 });
@@ -164,5 +177,52 @@ fn source_share(source: &StreamSource) -> StreamSource {
             data_start: *data_start,
             total: *total,
         },
+        StreamSource::MultiFileRange { segments, total } => StreamSource::MultiFileRange {
+            segments: segments.clone(),
+            total: *total,
+        },
+    }
+}
+
+/// Write `[start_byte, start_byte + content_length)` from the concatenated
+/// segment stream into `stream`. Walks segments in order, opening each part
+/// file, seeking to the in-file offset, and copying the relevant slice.
+fn stream_multi_range<W: Write>(
+    segments: &[FileSegment],
+    stream: &mut W,
+    start_byte: u64,
+    content_length: u64,
+) {
+    let mut remaining = content_length;
+    let mut logical_cur = 0u64;
+    for seg in segments {
+        if remaining == 0 {
+            break;
+        }
+        let seg_end = logical_cur + seg.len_in_file;
+        // Skip segments entirely before the requested window.
+        if seg_end <= start_byte {
+            logical_cur = seg_end;
+            continue;
+        }
+        // Compute the overlap of [start_byte, start_byte+content_length) with
+        // [logical_cur, seg_end) within this segment.
+        let window_start = logical_cur.max(start_byte);
+        let window_end = seg_end.min(start_byte + content_length);
+        if window_end <= window_start {
+            logical_cur = seg_end;
+            continue;
+        }
+        let offset_in_file = seg.start_in_file + (window_start - logical_cur);
+        let take = window_end - window_start;
+
+        if let Ok(mut f) = std::fs::File::open(&seg.path) {
+            if f.seek(SeekFrom::Start(offset_in_file)).is_ok() {
+                let mut chunk = f.take(take);
+                let _ = std::io::copy(&mut chunk, stream);
+            }
+        }
+        remaining = remaining.saturating_sub(take);
+        logical_cur = seg_end;
     }
 }
