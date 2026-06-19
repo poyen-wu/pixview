@@ -35,6 +35,59 @@ impl DisplayMode {
     }
 }
 
+#[derive(Clone, Copy, PartialEq)]
+enum Rotation {
+    Deg0,
+    Deg90,
+    Deg180,
+    Deg270,
+}
+
+impl Rotation {
+    fn degrees(&self) -> u32 {
+        match self {
+            Rotation::Deg0 => 0,
+            Rotation::Deg90 => 90,
+            Rotation::Deg180 => 180,
+            Rotation::Deg270 => 270,
+        }
+    }
+
+    fn rotate_cw(self) -> Self {
+        match self {
+            Rotation::Deg0 => Rotation::Deg90,
+            Rotation::Deg90 => Rotation::Deg180,
+            Rotation::Deg180 => Rotation::Deg270,
+            Rotation::Deg270 => Rotation::Deg0,
+        }
+    }
+
+    fn rotate_ccw(self) -> Self {
+        match self {
+            Rotation::Deg0 => Rotation::Deg270,
+            Rotation::Deg90 => Rotation::Deg0,
+            Rotation::Deg180 => Rotation::Deg90,
+            Rotation::Deg270 => Rotation::Deg180,
+        }
+    }
+
+    fn apply(self, img: &DynamicImage) -> DynamicImage {
+        match self {
+            Rotation::Deg0 => img.clone(),
+            Rotation::Deg90 => img.rotate90(),
+            Rotation::Deg180 => img.rotate180(),
+            Rotation::Deg270 => img.rotate270(),
+        }
+    }
+
+    fn effective_dims(self, w: u32, h: u32) -> (u32, u32) {
+        match self {
+            Rotation::Deg0 | Rotation::Deg180 => (w, h),
+            Rotation::Deg90 | Rotation::Deg270 => (h, w),
+        }
+    }
+}
+
 fn terminal_cell_size() -> (u32, u32) {
     let (cols, rows) = terminal::size().unwrap_or((80, 24));
 
@@ -114,15 +167,17 @@ fn compute_display_dims(
 fn encode_for_display(
     img: &DynamicImage,
     mode: DisplayMode,
+    rotation: Rotation,
     cols: u16,
     rows: u16,
     max_colors: usize,
 ) -> (Vec<u8>, u32, u32) {
-    let (dw, dh) = compute_display_dims(img.width(), img.height(), mode, cols, rows);
-    let resized = if dw != img.width() || dh != img.height() {
-        img.resize(dw, dh, image::imageops::FilterType::Triangle)
+    let rotated = rotation.apply(img);
+    let (dw, dh) = compute_display_dims(rotated.width(), rotated.height(), mode, cols, rows);
+    let resized = if dw != rotated.width() || dh != rotated.height() {
+        rotated.resize(dw, dh, image::imageops::FilterType::Triangle)
     } else {
-        img.clone()
+        rotated
     };
     let sixel = sixel::encode(&resized.to_rgba8(), max_colors);
     (sixel, dw, dh)
@@ -176,6 +231,27 @@ fn display_sixel<W: Write>(
     Ok(())
 }
 
+fn render_image_frame<W: Write>(
+    stdout: &mut W,
+    img: &DynamicImage,
+    mode: DisplayMode,
+    rotation: Rotation,
+    max_colors: usize,
+) -> Result<()> {
+    let (cols, rows) = terminal::size()?;
+    let (sixel, pw, ph) = encode_for_display(img, mode, rotation, cols, rows, max_colors);
+    let (rw, rh) = rotation.effective_dims(img.width(), img.height());
+    let status = format!(
+        " {}x{} [{}] {:>3}° │ f toggle │ [ ] rot │ \u{2191}\u{2193} File │ Esc Back ",
+        rw,
+        rh,
+        mode.label(),
+        rotation.degrees()
+    );
+    display_sixel(stdout, &sixel, pw, ph, cols, rows, Some(&status))?;
+    Ok(())
+}
+
 pub fn show_image<W: Write>(
     stdout: &mut W,
     path: &EntryPath,
@@ -190,15 +266,8 @@ pub fn show_image<W: Write>(
     };
 
     let mut mode = DisplayMode::Fit;
-    let (cols, rows) = terminal::size()?;
-    let (sixel, pw, ph) = encode_for_display(&img, mode, cols, rows, max_colors);
-    let status = format!(
-        " {}x{} [{}] │ f toggle │ \u{2191}\u{2193} File │ Esc Back ",
-        img.width(),
-        img.height(),
-        mode.label()
-    );
-    display_sixel(stdout, &sixel, pw, ph, cols, rows, Some(&status))?;
+    let mut rotation = Rotation::Deg0;
+    render_image_frame(stdout, &img, mode, rotation, max_colors)?;
 
     let action = loop {
         if event::poll(Duration::from_millis(200))? {
@@ -210,16 +279,15 @@ pub fn show_image<W: Write>(
                         } else {
                             DisplayMode::Fit
                         };
-                        let (cols, rows) = terminal::size()?;
-                        let (sixel, pw, ph) =
-                            encode_for_display(&img, mode, cols, rows, max_colors);
-                        let status = format!(
-                            " {}x{} [{}] │ f toggle │ \u{2191}\u{2193} File │ Esc Back ",
-                            img.width(),
-                            img.height(),
-                            mode.label()
-                        );
-                        display_sixel(stdout, &sixel, pw, ph, cols, rows, Some(&status))?;
+                        render_image_frame(stdout, &img, mode, rotation, max_colors)?;
+                    }
+                    KeyCode::Char('[') => {
+                        rotation = rotation.rotate_ccw();
+                        render_image_frame(stdout, &img, mode, rotation, max_colors)?;
+                    }
+                    KeyCode::Char(']') => {
+                        rotation = rotation.rotate_cw();
+                        render_image_frame(stdout, &img, mode, rotation, max_colors)?;
                     }
                     KeyCode::Up | KeyCode::Char('k') => break ViewerAction::PreviousFile,
                     KeyCode::Down | KeyCode::Char('j') => break ViewerAction::NextFile,
@@ -230,15 +298,7 @@ pub fn show_image<W: Write>(
                     _ => {}
                 },
                 Event::Resize(_, _) => {
-                    let (cols, rows) = terminal::size()?;
-                    let (sixel, pw, ph) = encode_for_display(&img, mode, cols, rows, max_colors);
-                    let status = format!(
-                        " {}x{} [{}] │ f toggle │ \u{2191}\u{2193} File │ Esc Back ",
-                        img.width(),
-                        img.height(),
-                        mode.label()
-                    );
-                    display_sixel(stdout, &sixel, pw, ph, cols, rows, Some(&status))?;
+                    render_image_frame(stdout, &img, mode, rotation, max_colors)?;
                 }
                 _ => {}
             }
@@ -296,6 +356,7 @@ pub fn show_video<W: Write>(
 
     let mut current: usize = 0;
     let mut mode = DisplayMode::Fit;
+    let mut rotation = Rotation::Deg0;
     let mut last_ready = 0usize;
     let mut rendered_frame: bool;
 
@@ -304,6 +365,7 @@ pub fn show_video<W: Write>(
         &frames,
         current,
         mode,
+        rotation,
         max_colors,
         n_frames,
         &timestamps,
@@ -319,6 +381,7 @@ pub fn show_video<W: Write>(
             let mut exit_action = None;
             let prev_current = current;
             let prev_mode = mode;
+            let prev_rotation = rotation;
 
             // Drain the entire event queue to merge sequential input events
             loop {
@@ -352,6 +415,12 @@ pub fn show_video<W: Write>(
                                 } else {
                                     DisplayMode::Fit
                                 };
+                            }
+                            KeyCode::Char('[') => {
+                                rotation = rotation.rotate_ccw();
+                            }
+                            KeyCode::Char(']') => {
+                                rotation = rotation.rotate_cw();
                             }
                             KeyCode::Up | KeyCode::Char('k') => {
                                 exit_action = Some(ViewerAction::PreviousFile);
@@ -388,12 +457,17 @@ pub fn show_video<W: Write>(
                 break action;
             }
 
-            if current != prev_current || mode != prev_mode || state_changed {
+            if current != prev_current
+                || mode != prev_mode
+                || rotation != prev_rotation
+                || state_changed
+            {
                 render_video_frame(
                     stdout,
                     &frames,
                     current,
                     mode,
+                    rotation,
                     max_colors,
                     n_frames,
                     &timestamps,
@@ -418,6 +492,7 @@ pub fn show_video<W: Write>(
                         &frames,
                         current,
                         mode,
+                        rotation,
                         max_colors,
                         n_frames,
                         &timestamps,
@@ -428,7 +503,7 @@ pub fn show_video<W: Write>(
                     rendered_frame = true;
                 } else {
                     let status = video_status(
-                        current, n_frames, &timestamps, duration, mode, &ready, &done,
+                        current, n_frames, &timestamps, duration, mode, rotation, &ready, &done,
                     );
                     update_status_line(stdout, &status)?;
                 }
@@ -476,6 +551,7 @@ fn video_status(
     timestamps: &[f64],
     duration: f64,
     mode: DisplayMode,
+    rotation: Rotation,
     ready: &AtomicUsize,
     done: &AtomicBool,
 ) -> String {
@@ -499,7 +575,7 @@ fn video_status(
     let digits = (n.saturating_sub(1)).to_string().len().max(1);
 
     format!(
-        " [{:>w$}/{}] {:>3.0}% {} {} / {} [{}]{} │ \u{2190}\u{2192} \u{00b1}1 │ Tab +10 │ \u{232b} -10 │ Space End │ \u{2191}\u{2193} File │ Esc Back ",
+        " [{:>w$}/{}] {:>3.0}% {} {} / {} [{} {:>3}°]{} │ \u{2190}\u{2192} \u{00b1}1 │ Tab +10 │ \u{232b} -10 │ Space End │ [ ] rot │ \u{2191}\u{2193} File │ Esc Back ",
         current,
         n - 1,
         progress,
@@ -507,6 +583,7 @@ fn video_status(
         format_time(ts),
         format_time(duration),
         mode.label(),
+        rotation.degrees(),
         load_tag,
         w = digits,
     )
@@ -517,6 +594,7 @@ fn render_video_frame<W: Write>(
     frames: &Arc<Mutex<Vec<Option<DynamicImage>>>>,
     current: usize,
     mode: DisplayMode,
+    rotation: Rotation,
     max_colors: usize,
     n: usize,
     timestamps: &[f64],
@@ -528,8 +606,10 @@ fn render_video_frame<W: Write>(
     let guard = frames.lock().unwrap();
     match &guard[current] {
         Some(img) => {
-            let (sixel, pw, ph) = encode_for_display(img, mode, cols, rows, max_colors);
-            let status = video_status(current, n, timestamps, duration, mode, ready, done);
+            let (sixel, pw, ph) = encode_for_display(img, mode, rotation, cols, rows, max_colors);
+            let status = video_status(
+                current, n, timestamps, duration, mode, rotation, ready, done,
+            );
             drop(guard);
             display_sixel(stdout, &sixel, pw, ph, cols, rows, Some(&status))?;
         }
